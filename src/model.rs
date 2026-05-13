@@ -2,6 +2,8 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::desktop_apps::AliasIndex;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "mcp", derive(JsonSchema))]
 pub struct Rect {
@@ -69,8 +71,9 @@ pub struct WindowAppRef {
 }
 
 impl WindowInfo {
-    pub fn bundle_id(&self) -> Option<String> {
+    pub fn bundle_id(&self, idx: &AliasIndex) -> Option<String> {
         bundle_id_from_parts(
+            idx,
             Some(self.id.as_str()),
             self.desktop_file_name.as_deref(),
             self.resource_class.as_deref(),
@@ -80,32 +83,12 @@ impl WindowInfo {
         )
     }
 
-    pub fn display_name(&self) -> String {
+    pub fn display_name(&self, idx: &AliasIndex) -> String {
         if !self.title.trim().is_empty() {
             return self.title.clone();
         }
 
-        self.bundle_id().unwrap_or_else(|| self.id.clone())
-    }
-
-    #[cfg_attr(not(any(feature = "mcp", test)), allow(dead_code))]
-    pub fn matches_bundle_id(&self, expected: &str) -> bool {
-        let expected = normalize_bundle_id_value(expected);
-        if let Some(bundle_id) = self.bundle_id()
-            && normalize_bundle_id_value(&bundle_id) == expected
-        {
-            return true;
-        }
-
-        [
-            Some(self.id.as_str()),
-            self.desktop_file_name.as_deref(),
-            self.resource_class.as_deref(),
-            self.resource_name.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|candidate| normalize_bundle_id_value(candidate) == expected)
+        self.bundle_id(idx).unwrap_or_else(|| self.id.clone())
     }
 
     pub fn is_transient_for_window(&self, window_id: &str) -> bool {
@@ -116,8 +99,9 @@ impl WindowInfo {
 }
 
 impl WindowAppRef {
-    fn bundle_id(&self) -> Option<String> {
+    fn bundle_id(&self, idx: &AliasIndex) -> Option<String> {
         bundle_id_from_parts(
+            idx,
             Some(self.id.as_str()),
             self.desktop_file_name.as_deref(),
             self.resource_class.as_deref(),
@@ -137,6 +121,7 @@ impl WindowAppRef {
 }
 
 fn bundle_id_from_parts(
+    idx: &AliasIndex,
     id: Option<&str>,
     desktop_file_name: Option<&str>,
     resource_class: Option<&str>,
@@ -144,36 +129,19 @@ fn bundle_id_from_parts(
     transient: bool,
     transient_for: Option<&WindowAppRef>,
 ) -> Option<String> {
-    if transient && let Some(bundle_id) = transient_for.and_then(WindowAppRef::bundle_id) {
+    if transient && let Some(bundle_id) = transient_for.and_then(|parent| parent.bundle_id(idx)) {
         return Some(bundle_id);
     }
 
-    for candidate in [desktop_file_name, resource_class, resource_name] {
-        let normalized = normalize_optional_bundle_id(candidate);
-        if normalized.is_some() {
-            return normalized;
+    for candidate in [desktop_file_name, resource_class, resource_name, id] {
+        if let Some(value) = candidate
+            && !value.trim().is_empty()
+        {
+            return Some(idx.canonicalize(value));
         }
     }
 
-    normalize_optional_bundle_id(id)
-}
-
-fn normalize_optional_bundle_id(value: Option<&str>) -> Option<String> {
-    let value = value?.trim();
-    if value.is_empty() {
-        return None;
-    }
-
-    Some(value.strip_suffix(".desktop").unwrap_or(value).to_owned())
-}
-
-#[cfg_attr(not(any(feature = "mcp", test)), allow(dead_code))]
-fn normalize_bundle_id_value(value: &str) -> String {
-    value
-        .trim()
-        .strip_suffix(".desktop")
-        .unwrap_or(value.trim())
-        .to_ascii_lowercase()
+    None
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -430,7 +398,11 @@ pub struct CapturedFrame {
 
 #[cfg(test)]
 mod tests {
-    use super::{Rect, WindowAppRef, WindowInfo};
+    use super::{AliasIndex, Rect, WindowAppRef, WindowInfo};
+
+    fn empty_index() -> AliasIndex {
+        AliasIndex::default()
+    }
 
     fn test_window(
         id: &str,
@@ -473,6 +445,7 @@ mod tests {
 
     #[test]
     fn transient_windows_resolve_bundle_id_from_parent() {
+        let idx = empty_index();
         let transient_for = WindowAppRef {
             id: "{calc}".to_owned(),
             desktop_file_name: Some("libreoffice-calc".to_owned()),
@@ -491,12 +464,12 @@ mod tests {
             Some(transient_for),
         );
 
-        assert_eq!(dialog.bundle_id().as_deref(), Some("libreoffice-calc"));
-        assert!(dialog.matches_bundle_id("libreoffice-calc"));
+        assert_eq!(dialog.bundle_id(&idx).as_deref(), Some("libreoffice-calc"));
     }
 
     #[test]
     fn transient_windows_fall_back_to_their_own_identifiers_when_parent_is_missing() {
+        let idx = empty_index();
         let dialog = test_window(
             "{dialog}",
             "",
@@ -507,10 +480,10 @@ mod tests {
         );
 
         assert_eq!(
-            dialog.bundle_id().as_deref(),
+            dialog.bundle_id(&idx).as_deref(),
             Some("libreoffice-startcenter")
         );
-        assert_eq!(dialog.display_name(), "libreoffice-startcenter");
+        assert_eq!(dialog.display_name(&idx), "libreoffice-startcenter");
     }
 
     #[test]
@@ -543,5 +516,60 @@ mod tests {
         assert!(dialog.is_transient_for_window("{parent}"));
         assert!(dialog.is_transient_for_window("{root}"));
         assert!(!dialog.is_transient_for_window("{other}"));
+    }
+
+    #[test]
+    fn unmapped_window_falls_back_to_lowercased_resource_class() {
+        let idx = empty_index();
+        let window = test_window(
+            "{firefox}",
+            "Firefox",
+            None,
+            Some("Firefox"),
+            Some(false),
+            None,
+        );
+
+        assert_eq!(window.bundle_id(&idx).as_deref(), Some("firefox"));
+    }
+
+    #[test]
+    fn window_with_desktop_suffix_strips_it() {
+        let idx = empty_index();
+        let window = test_window(
+            "{kcalc}",
+            "KCalc",
+            Some("org.kde.kcalc.desktop"),
+            Some("kcalc"),
+            Some(false),
+            None,
+        );
+
+        // No alias index: desktop_file_name wins (first in candidate order),
+        // `.desktop` stripped, lowercased -> "org.kde.kcalc".
+        assert_eq!(window.bundle_id(&idx).as_deref(), Some("org.kde.kcalc"));
+    }
+
+    #[test]
+    fn kde_app_canonicalizes_via_alias_index() {
+        // Mirrors a real KCalc install: file stem `org.kde.kcalc`, FDO id
+        // `org.kde.kcalc`, StartupWMClass `kcalc`. All three resolve to the
+        // canonical bundle id `kcalc`.
+        let idx = AliasIndex::for_tests([
+            ("org.kde.kcalc", "kcalc"),
+            ("org.kde.kcalc.desktop", "kcalc"),
+            ("kcalc", "kcalc"),
+        ]);
+
+        let window = test_window(
+            "{kcalc}",
+            "KCalc",
+            Some("org.kde.kcalc"),
+            Some("kcalc"),
+            Some(false),
+            None,
+        );
+
+        assert_eq!(window.bundle_id(&idx).as_deref(), Some("kcalc"));
     }
 }
