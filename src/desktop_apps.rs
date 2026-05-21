@@ -1,44 +1,58 @@
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use freedesktop_desktop_entry::unicase::Ascii;
 use freedesktop_desktop_entry::{DesktopEntry, Iter, get_languages_from_env};
 use freedesktop_icons::lookup;
 
 use crate::model::{InstalledDesktopApp, OpenAppResult};
 
-pub struct DesktopAppService;
+pub struct DesktopAppService {
+    cached: OnceLock<Arc<AliasIndex>>,
+}
 
 impl DesktopAppService {
     pub fn new() -> Self {
-        Self
+        Self {
+            cached: OnceLock::new(),
+        }
+    }
+
+    pub fn alias_index(&self) -> Result<Arc<AliasIndex>> {
+        if let Some(idx) = self.cached.get() {
+            return Ok(idx.clone());
+        }
+        let idx = Arc::new(build_alias_index()?);
+        Ok(self.cached.get_or_init(|| idx).clone())
     }
 
     pub fn list_installed_apps(&self) -> Result<Vec<InstalledDesktopApp>> {
-        Ok(load_index()?
-            .into_iter()
-            .map(|entry| entry.installed_app)
+        Ok(self
+            .alias_index()?
+            .entries
+            .iter()
+            .map(|entry| entry.installed_app.clone())
             .collect())
     }
 
     pub fn get_app_icon(&self, target: &str) -> Result<Option<String>> {
-        let index = load_index()?;
-        let entry = resolve_entry(target, &index)?;
+        let index = self.alias_index()?;
+        let entry = index.resolve_entry(target)?;
         resolve_icon_data_url(&entry.entry)
     }
 
     pub fn open_app(&self, target: &str) -> Result<OpenAppResult> {
-        let index = load_index()?;
-        let entry = resolve_entry(target, &index)?;
+        let index = self.alias_index()?;
+        let entry = index.resolve_entry(target)?;
 
         let launcher = if entry.entry.dbus_activatable() || entry.entry.exec().is_none() {
             launch_via_kio(&entry.entry)?;
@@ -72,16 +86,98 @@ impl DesktopAppService {
 }
 
 #[derive(Debug, Clone)]
-struct IndexedDesktopEntry {
-    installed_app: InstalledDesktopApp,
-    entry: DesktopEntry,
+pub struct IndexedDesktopEntry {
+    pub installed_app: InstalledDesktopApp,
+    pub entry: DesktopEntry,
 }
 
-fn load_index() -> Result<Vec<IndexedDesktopEntry>> {
+/// Maps every alias a `.desktop` entry exposes (lowercased) to its canonical
+/// bundle id. Built once and shared across commands so window-derived raw
+/// strings (KWin's `desktop_file_name`, X11 `resource_class`, etc.) and
+/// installed-app entries resolve to the same string.
+#[derive(Debug, Clone, Default)]
+pub struct AliasIndex {
+    entries: Vec<IndexedDesktopEntry>,
+    aliases: HashMap<String, String>,
+}
+
+impl AliasIndex {
+    /// Map a raw identifier to its canonical bundle id. Used for
+    /// window-derived strings only — bridge inputs are compared verbatim.
+    /// Unknown inputs return their normalized self (lowercased, trimmed,
+    /// `.desktop`-stripped) as a deterministic fallback.
+    pub fn canonicalize(&self, raw: &str) -> String {
+        let normalized = normalize_alias_key(raw);
+        match self.aliases.get(&normalized) {
+            Some(canonical) => canonical.clone(),
+            None => normalized,
+        }
+    }
+
+    /// Test-only builder so other modules can construct a populated index
+    /// without walking XDG dirs. Each input pair is `(raw_alias,
+    /// canonical_bundle_id)`; the alias is normalized via `normalize_alias_key`
+    /// so callers can pass whatever case/suffix variant they like.
+    #[cfg(test)]
+    pub(crate) fn for_tests<I, K, V>(pairs: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: Into<String>,
+    {
+        let mut aliases = HashMap::new();
+        for (alias, canonical) in pairs {
+            aliases.insert(normalize_alias_key(alias.as_ref()), canonical.into());
+        }
+        AliasIndex {
+            entries: Vec::new(),
+            aliases,
+        }
+    }
+
+    /// Strict lookup: path equality first, then exact canonical bundle id
+    /// match. Upstream owns "did you mean?" — non-canonical inputs error.
+    pub fn resolve_entry(&self, target: &str) -> Result<&IndexedDesktopEntry> {
+        let target = target.trim();
+        if target.is_empty() {
+            bail!("app target is empty");
+        }
+
+        let target_path = PathBuf::from(target);
+        if let Some(found) = self
+            .entries
+            .iter()
+            .find(|entry| entry.entry.path == target_path)
+        {
+            return Ok(found);
+        }
+
+        if let Some(found) = self
+            .entries
+            .iter()
+            .find(|entry| entry.installed_app.bundle_id == target)
+        {
+            return Ok(found);
+        }
+
+        bail!("could not resolve `{target}` to a launchable desktop application")
+    }
+}
+
+fn normalize_alias_key(raw: &str) -> String {
+    let trimmed = raw.trim();
+    trimmed
+        .strip_suffix(".desktop")
+        .unwrap_or(trimmed)
+        .to_ascii_lowercase()
+}
+
+fn build_alias_index() -> Result<AliasIndex> {
     let locales = get_languages_from_env();
     let desktops = current_desktops();
     let mut seen_bundle_ids = HashSet::new();
-    let mut indexed = Vec::new();
+    let mut entries = Vec::new();
+    let mut aliases: HashMap<String, String> = HashMap::new();
 
     for entry in Iter::new(desktop_entry_dirs().into_iter()).entries(Some(&locales)) {
         if !entry_is_visible(&entry, &desktops) {
@@ -97,7 +193,13 @@ fn load_index() -> Result<Vec<IndexedDesktopEntry>> {
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| bundle_id.clone());
 
-        indexed.push(IndexedDesktopEntry {
+        for alias in collect_aliases(&entry) {
+            // Aliases registered for the canonical bundle id win on the first
+            // entry that claims them; later entries can't shadow earlier ones.
+            aliases.entry(alias).or_insert_with(|| bundle_id.clone());
+        }
+
+        entries.push(IndexedDesktopEntry {
             installed_app: InstalledDesktopApp {
                 bundle_id,
                 display_name,
@@ -107,52 +209,27 @@ fn load_index() -> Result<Vec<IndexedDesktopEntry>> {
         });
     }
 
-    Ok(indexed)
+    Ok(AliasIndex { entries, aliases })
 }
 
-fn resolve_entry<'a>(
-    target: &str,
-    indexed: &'a [IndexedDesktopEntry],
-) -> Result<&'a IndexedDesktopEntry> {
-    let target = target.trim();
-    if target.is_empty() {
-        bail!("app target is empty");
-    }
-    let target_path = PathBuf::from(target);
-    if let Some(found) = indexed.iter().find(|entry| entry.entry.path == target_path) {
-        return Ok(found);
-    }
+fn collect_aliases(entry: &DesktopEntry) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut push = |value: Option<&str>| {
+        if let Some(value) = value {
+            let normalized = normalize_alias_key(value);
+            if !normalized.is_empty() {
+                out.push(normalized);
+            }
+        }
+    };
 
-    if let Some(found) = indexed
-        .iter()
-        .find(|entry| entry.installed_app.bundle_id.eq_ignore_ascii_case(target))
-    {
-        return Ok(found);
+    push(entry.path.file_stem().and_then(OsStr::to_str));
+    push(Some(entry.id()));
+    push(entry.startup_wm_class());
+    if let Some(name) = exec_program_name(entry) {
+        push(Some(name.as_str()));
     }
-
-    if let Some(found) = indexed
-        .iter()
-        .find(|entry| entry.entry.matches_id(Ascii::new(target)))
-    {
-        return Ok(found);
-    }
-
-    if let Some(found) = indexed
-        .iter()
-        .find(|entry| entry.entry.matches_name(Ascii::new(target)))
-    {
-        return Ok(found);
-    }
-
-    if let Some(found) = indexed.iter().find(|entry| {
-        exec_program_name(&entry.entry)
-            .map(|name| name.eq_ignore_ascii_case(target))
-            .unwrap_or(false)
-    }) {
-        return Ok(found);
-    }
-
-    bail!("could not resolve `{target}` to a launchable desktop application")
+    out
 }
 
 fn entry_is_visible(entry: &DesktopEntry, current_desktops: &HashSet<String>) -> bool {
@@ -235,20 +312,27 @@ fn desktop_entry_dirs() -> Vec<PathBuf> {
 }
 
 fn canonical_bundle_id(entry: &DesktopEntry) -> String {
-    entry
+    // Prefer StartupWMClass: it's what the .desktop file declares its X11
+    // windows will report, so windows and installed-app entries agree on the
+    // same string without translation. Lowercase to match KWin's
+    // case-folded resource_class.
+    if let Some(value) = entry
         .startup_wm_class()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| normalize_bundle_id(&entry.path, entry.id()))
-}
+    {
+        return value.to_ascii_lowercase();
+    }
 
-fn normalize_bundle_id(path: &Path, fallback_id: &str) -> String {
-    path.file_stem()
+    let fallback_id = entry.id();
+    let stem = entry
+        .path
+        .file_stem()
         .and_then(OsStr::to_str)
         .or_else(|| Path::new(fallback_id).file_stem().and_then(OsStr::to_str))
-        .unwrap_or(fallback_id)
-        .to_owned()
+        .unwrap_or(fallback_id);
+
+    normalize_alias_key(stem)
 }
 
 fn try_exec_available(try_exec: &str) -> bool {
@@ -585,15 +669,8 @@ fn spawn_detached(command: &mut Command) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DesktopAppService, expand_exec_token, split_exec};
+    use super::{expand_exec_token, split_exec};
 
-    #[test]
-    fn launch_desktop_entry() {
-        let das = DesktopAppService::new();
-        let result = das.open_app("com.mitchellh.ghostty").unwrap();
-        println!("{:?}", result);
-        // launch_via_kio(&DesktopEntry::from_path(PathBuf::from("/usr/share/applications/systemsettings.desktop"), Some(&get_languages_from_env())).unwrap());
-    }
     #[test]
     fn split_exec_handles_quotes_and_escapes() {
         let parsed = split_exec(r#"app --flag "hello world" 'two words'"#).unwrap();

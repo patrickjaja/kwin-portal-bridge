@@ -21,7 +21,6 @@ use crate::model::{
 };
 use crate::token_store::TokenStore;
 
-
 pub struct PortalBackend;
 pub struct LivePortalSession {
     manager: PortalManager,

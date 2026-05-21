@@ -1,8 +1,10 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use anyhow::{Result, bail};
 
 use crate::capture::{CaptureBackend, resolve_screen};
+use crate::desktop_apps::{AliasIndex, DesktopAppService};
 use crate::exclude_state::ExcludeStateStore;
 use crate::kwin::KWinBackend;
 use crate::model::{
@@ -13,17 +15,21 @@ use crate::model::{
 use crate::portal::{PortalBackend, point_in_screen};
 use crate::util;
 
-const BRIDGE_BUNDLE_ID: &str = env!("CARGO_PKG_NAME");
-
 pub struct ExecutorBackend {
     state: ExcludeStateStore,
+    desktop_apps: DesktopAppService,
 }
 
 impl ExecutorBackend {
     pub fn new() -> Result<Self> {
         Ok(Self {
             state: ExcludeStateStore::new()?,
+            desktop_apps: DesktopAppService::new(),
         })
+    }
+
+    fn alias_index(&self) -> Result<Arc<AliasIndex>> {
+        self.desktop_apps.alias_index()
     }
 
     pub fn preview_hide_set(
@@ -33,22 +39,27 @@ impl ExecutorBackend {
         display: Option<&str>,
         kwin: &KWinBackend,
     ) -> Result<Vec<AppRef>> {
+        let idx = self.alias_index()?;
         let screens = kwin.list_screens()?;
         let screen = resolve_optional_screen(&screens, display)?;
         let windows = kwin.list_windows()?;
         let candidates =
-            select_hide_candidates(&windows, screen, allowed_bundle_ids, host_bundle_id);
-        Ok(to_app_refs(&candidates))
+            select_hide_candidates(&windows, screen, allowed_bundle_ids, host_bundle_id, &idx);
+        Ok(to_app_refs(&candidates, &idx))
     }
 
     pub fn frontmost_app(&self, kwin: &KWinBackend) -> Result<Option<AppRef>> {
+        let idx = self.alias_index()?;
         let windows = kwin.list_windows()?;
-        Ok(frontmost_window_ignoring_bridge(&windows).map(app_ref_for_window))
+        Ok(frontmost_window_ignoring_bridge(&windows)
+            .map(|window| app_ref_for_window(window, &idx)))
     }
 
     pub fn app_under_point(&self, x: i32, y: i32, kwin: &KWinBackend) -> Result<Option<AppRef>> {
+        let idx = self.alias_index()?;
         let windows = kwin.list_windows()?;
-        Ok(top_window_at_point_ignoring_bridge(&windows, x, y).map(app_ref_for_window))
+        Ok(top_window_at_point_ignoring_bridge(&windows, x, y)
+            .map(|window| app_ref_for_window(window, &idx)))
     }
 
     pub fn raise_allowed_window_at_point(
@@ -59,6 +70,26 @@ impl ExecutorBackend {
         y: i32,
         kwin: &KWinBackend,
     ) -> Result<RaiseWindowAtPointResult> {
+        let idx = self.alias_index()?;
+        self.raise_allowed_window_at_point_inner(
+            allowed_bundle_ids,
+            host_bundle_id,
+            x,
+            y,
+            kwin,
+            &idx,
+        )
+    }
+
+    fn raise_allowed_window_at_point_inner(
+        &self,
+        allowed_bundle_ids: &[String],
+        host_bundle_id: &str,
+        x: i32,
+        y: i32,
+        kwin: &KWinBackend,
+        idx: &AliasIndex,
+    ) -> Result<RaiseWindowAtPointResult> {
         let windows = kwin.list_windows()?;
         let Some(topmost_window) = top_window_at_point(&windows, x, y) else {
             return Ok(RaiseWindowAtPointResult {
@@ -68,9 +99,9 @@ impl ExecutorBackend {
             });
         };
 
-        let topmost = app_ref_for_window(topmost_window);
+        let topmost = app_ref_for_window(topmost_window, idx);
         if is_shell_window(topmost_window)
-            || is_window_allowed(topmost_window, allowed_bundle_ids, host_bundle_id)
+            || is_window_allowed(topmost_window, allowed_bundle_ids, host_bundle_id, idx)
         {
             return Ok(RaiseWindowAtPointResult {
                 topmost: Some(topmost),
@@ -85,7 +116,7 @@ impl ExecutorBackend {
             .skip(1)
             .find(|window| {
                 !is_shell_window(window)
-                    && is_window_allowed(window, allowed_bundle_ids, host_bundle_id)
+                    && is_window_allowed(window, allowed_bundle_ids, host_bundle_id, idx)
             });
 
         let Some(target) = target else {
@@ -100,7 +131,7 @@ impl ExecutorBackend {
 
         Ok(RaiseWindowAtPointResult {
             topmost: Some(topmost),
-            raised: Some(app_ref_for_window(target)),
+            raised: Some(app_ref_for_window(target, idx)),
             blocked_by: None,
         })
     }
@@ -416,11 +447,12 @@ impl ExecutorBackend {
     ) -> Result<PrepareActionResult> {
         self.restore_prepare_state(kwin)?;
 
+        let idx = self.alias_index()?;
         let screens = kwin.list_screens()?;
         let screen = resolve_optional_screen(&screens, display)?;
         let windows = kwin.list_windows()?;
         let candidates =
-            select_hide_candidates(&windows, screen, allowed_bundle_ids, host_bundle_id);
+            select_hide_candidates(&windows, screen, allowed_bundle_ids, host_bundle_id, &idx);
         let changed_window_ids = windows_to_change(&candidates, true);
 
         if !changed_window_ids.is_empty() {
@@ -436,10 +468,11 @@ impl ExecutorBackend {
             allowed_bundle_ids,
             host_bundle_id,
             kwin,
+            &idx,
         )?;
 
         Ok(PrepareActionResult {
-            hidden: hidden_bundle_ids(&candidates),
+            hidden: hidden_bundle_ids(&candidates, &idx),
             activated,
         })
     }
@@ -484,15 +517,21 @@ impl ExecutorBackend {
         portal: &PortalBackend,
         kwin: &KWinBackend,
     ) -> Result<ResolvePrepareCaptureResult> {
+        let idx = self.alias_index()?;
         let screens = kwin.list_screens()?;
         let windows = kwin.list_windows()?;
-        let screen = resolve_capture_screen(&screens, &windows, display, host_bundle_id)?;
+        let screen = resolve_capture_screen(&screens, &windows, display, host_bundle_id, &idx)?;
 
         let (hidden, activated, changed_window_ids) = if do_hide {
-            let candidates =
-                select_hide_candidates(&windows, Some(screen), allowed_bundle_ids, host_bundle_id);
-            let hidden = hidden_bundle_ids(&candidates);
-            let activated = active_bundle_id(&windows);
+            let candidates = select_hide_candidates(
+                &windows,
+                Some(screen),
+                allowed_bundle_ids,
+                host_bundle_id,
+                &idx,
+            );
+            let hidden = hidden_bundle_ids(&candidates, &idx);
+            let activated = active_bundle_id(&windows, &idx);
             let changed_window_ids = windows_to_change(&candidates, true);
 
             if !changed_window_ids.is_empty() {
@@ -534,10 +573,11 @@ fn resolve_capture_screen<'a>(
     windows: &[WindowInfo],
     selector: Option<&str>,
     host_bundle_id: &str,
+    idx: &AliasIndex,
 ) -> Result<&'a ScreenInfo> {
     match selector {
         Some(_) => resolve_screen(screens, selector),
-        None => auto_capture_screen(screens, windows, host_bundle_id),
+        None => auto_capture_screen(screens, windows, host_bundle_id, idx),
     }
 }
 
@@ -545,12 +585,13 @@ fn auto_capture_screen<'a>(
     screens: &'a [ScreenInfo],
     windows: &[WindowInfo],
     host_bundle_id: &str,
+    idx: &AliasIndex,
 ) -> Result<&'a ScreenInfo> {
     if screens.is_empty() {
         bail!("no screens reported by KWin");
     }
 
-    if let Some(screen) = screen_for_host_window(screens, windows, host_bundle_id) {
+    if let Some(screen) = screen_for_host_window(screens, windows, host_bundle_id, idx) {
         return Ok(screen);
     }
 
@@ -614,15 +655,13 @@ fn select_hide_candidates<'a>(
     screen: Option<&ScreenInfo>,
     allowed_bundle_ids: &[String],
     host_bundle_id: &str,
+    idx: &AliasIndex,
 ) -> Vec<&'a WindowInfo> {
-    let mut allowed: HashSet<String> = allowed_bundle_ids.iter().cloned().collect();
-    allowed.insert(host_bundle_id.to_owned());
-
     windows
         .iter()
         .filter(|window| window_matches_screen(window, screen))
         .filter(|window| !is_shell_window(window))
-        .filter(|window| !is_window_allowed(window, allowed_bundle_ids, host_bundle_id))
+        .filter(|window| !is_window_allowed(window, allowed_bundle_ids, host_bundle_id, idx))
         .collect()
 }
 
@@ -632,13 +671,14 @@ fn activate_visible_windows_in_z_order(
     allowed_bundle_ids: &[String],
     host_bundle_id: &str,
     kwin: &KWinBackend,
+    idx: &AliasIndex,
 ) -> Result<Option<String>> {
     let mut visible_windows: Vec<_> = windows
         .iter()
         .filter(|window| window_matches_screen(window, screen))
         .filter(|window| !is_shell_window(window))
         .filter(|window| !is_bridge_window(window))
-        .filter(|window| !is_host_window(window, host_bundle_id))
+        .filter(|window| !is_host_window(window, host_bundle_id, idx))
         .filter(|window| is_window_visible_for_hit_test(window))
         .collect();
 
@@ -647,7 +687,7 @@ fn activate_visible_windows_in_z_order(
     let mut seen_allowed = false;
     let mut needs_activation = false;
     for window in visible_windows.iter().rev() {
-        if is_window_allowed(window, allowed_bundle_ids, host_bundle_id) {
+        if is_window_allowed(window, allowed_bundle_ids, host_bundle_id, idx) {
             seen_allowed = true;
             continue;
         }
@@ -664,19 +704,19 @@ fn activate_visible_windows_in_z_order(
 
     let activatable: Vec<_> = visible_windows
         .into_iter()
-        .filter(|window| is_window_allowed(window, allowed_bundle_ids, host_bundle_id))
+        .filter(|window| is_window_allowed(window, allowed_bundle_ids, host_bundle_id, idx))
         .collect();
 
     let mut activated = None;
     for window in activatable {
         kwin.activate_window(&window.id)?;
-        activated = bundle_id_for_window(window);
+        activated = bundle_id_for_window(window, idx);
     }
 
     Ok(activated)
 }
 
-fn to_app_refs(windows: &[&WindowInfo]) -> Vec<AppRef> {
+fn to_app_refs(windows: &[&WindowInfo], idx: &AliasIndex) -> Vec<AppRef> {
     let mut seen = HashSet::<String>::new();
     let mut apps = Vec::new();
 
@@ -685,14 +725,14 @@ fn to_app_refs(windows: &[&WindowInfo]) -> Vec<AppRef> {
             continue;
         }
 
-        let Some(bundle_id) = bundle_id_for_window(window) else {
+        let Some(bundle_id) = bundle_id_for_window(window, idx) else {
             continue;
         };
 
         if seen.insert(bundle_id.clone()) {
             apps.push(AppRef {
                 bundle_id,
-                display_name: display_name_for_window(window),
+                display_name: display_name_for_window(window, idx),
             });
         }
     }
@@ -708,7 +748,7 @@ fn windows_to_change(windows: &[&WindowInfo], value: bool) -> Vec<String> {
         .collect()
 }
 
-fn hidden_bundle_ids(windows: &[&WindowInfo]) -> Vec<String> {
+fn hidden_bundle_ids(windows: &[&WindowInfo], idx: &AliasIndex) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut hidden = Vec::new();
 
@@ -717,7 +757,7 @@ fn hidden_bundle_ids(windows: &[&WindowInfo]) -> Vec<String> {
             continue;
         }
 
-        let Some(bundle_id) = bundle_id_for_window(window) else {
+        let Some(bundle_id) = bundle_id_for_window(window, idx) else {
             continue;
         };
 
@@ -729,10 +769,10 @@ fn hidden_bundle_ids(windows: &[&WindowInfo]) -> Vec<String> {
     hidden
 }
 
-fn app_ref_for_window(window: &WindowInfo) -> AppRef {
+fn app_ref_for_window(window: &WindowInfo, idx: &AliasIndex) -> AppRef {
     AppRef {
-        bundle_id: bundle_id_for_window(window).unwrap_or_else(|| window.id.clone()),
-        display_name: display_name_for_window(window),
+        bundle_id: bundle_id_for_window(window, idx).unwrap_or_else(|| window.id.clone()),
+        display_name: display_name_for_window(window, idx),
     }
 }
 
@@ -825,8 +865,8 @@ fn key_name_to_key_code(name: &str) -> Result<i32> {
     Ok(code)
 }
 
-fn active_bundle_id(windows: &[WindowInfo]) -> Option<String> {
-    frontmost_window_ignoring_bridge(windows).and_then(bundle_id_for_window)
+fn active_bundle_id(windows: &[WindowInfo], idx: &AliasIndex) -> Option<String> {
+    frontmost_window_ignoring_bridge(windows).and_then(|window| bundle_id_for_window(window, idx))
 }
 
 fn frontmost_window_ignoring_bridge(windows: &[WindowInfo]) -> Option<&WindowInfo> {
@@ -846,10 +886,11 @@ fn screen_for_host_window<'a>(
     screens: &'a [ScreenInfo],
     windows: &[WindowInfo],
     host_bundle_id: &str,
+    idx: &AliasIndex,
 ) -> Option<&'a ScreenInfo> {
     windows
         .iter()
-        .filter(|window| is_host_window(window, host_bundle_id))
+        .filter(|window| is_host_window(window, host_bundle_id, idx))
         .filter(|window| !is_shell_window(window))
         .filter(|window| is_window_visible_for_hit_test(window))
         .max_by_key(|window| {
@@ -861,24 +902,20 @@ fn screen_for_host_window<'a>(
         .and_then(|window| screen_for_window(screens, window))
 }
 
-fn bundle_id_for_window(window: &WindowInfo) -> Option<String> {
-    window.bundle_id()
+fn bundle_id_for_window(window: &WindowInfo, idx: &AliasIndex) -> Option<String> {
+    window.bundle_id(idx)
 }
 
-fn normalize_bundle_id(value: Option<&str>) -> Option<String> {
-    let value = value?.trim();
-    if value.is_empty() {
-        return None;
-    }
-
-    Some(value.strip_suffix(".desktop").unwrap_or(value).to_owned())
-}
-
-fn display_name_for_window(window: &WindowInfo) -> String {
-    window.display_name()
+fn display_name_for_window(window: &WindowInfo, idx: &AliasIndex) -> String {
+    window.display_name(idx)
 }
 
 fn is_bridge_window(window: &WindowInfo) -> bool {
+    // Bridge windows (including the teach/session overlays we spawn) are
+    // tagged with our process's executable name as their X11 class. The
+    // binary is usually `kwin-portal-bridge` but may be renamed at install
+    // time, so consult `util::bridge_overlay_names()` for both.
+    let overlay_names = util::bridge_overlay_names();
     [
         window.desktop_file_name.as_deref(),
         window.resource_class.as_deref(),
@@ -886,32 +923,39 @@ fn is_bridge_window(window: &WindowInfo) -> bool {
     ]
     .into_iter()
     .flatten()
-    .filter_map(|value| normalize_bundle_id(Some(value)))
-    .any(|value| value == BRIDGE_BUNDLE_ID)
+    .map(|value| {
+        let trimmed = value.trim();
+        trimmed
+            .strip_suffix(".desktop")
+            .unwrap_or(trimmed)
+            .to_ascii_lowercase()
+    })
+    .any(|value| overlay_names.iter().any(|name| name == &value))
 }
 
 fn is_shell_window(window: &WindowInfo) -> bool {
     window.is_dock.unwrap_or(false) || window.is_desktop.unwrap_or(false)
-    // window.is_desktop.unwrap_or(false)
 }
 
-fn is_host_window(window: &WindowInfo, host_bundle_id: &str) -> bool {
-    bundle_id_for_window(window)
+fn is_host_window(window: &WindowInfo, host_bundle_id: &str, idx: &AliasIndex) -> bool {
+    bundle_id_for_window(window, idx)
         .map(|bundle_id| bundle_id == host_bundle_id)
         .unwrap_or(false)
 }
 
+/// Compare a window's canonical bundle id against the allowlist verbatim.
+/// Inputs are treated as canonical — upstream owns alias resolution by
+/// querying `list-installed-apps` and matching strings.
 fn is_window_allowed(
     window: &WindowInfo,
     allowed_bundle_ids: &[String],
     host_bundle_id: &str,
+    idx: &AliasIndex,
 ) -> bool {
-    let mut allowed: HashSet<String> = allowed_bundle_ids.iter().cloned().collect();
-    allowed.insert(host_bundle_id.to_owned());
-
-    bundle_id_for_window(window)
-        .map(|bundle_id| allowed.contains(&bundle_id))
-        .unwrap_or(false)
+    let Some(bundle_id) = bundle_id_for_window(window, idx) else {
+        return false;
+    };
+    bundle_id == host_bundle_id || allowed_bundle_ids.iter().any(|id| id == &bundle_id)
 }
 
 fn top_window_at_point(windows: &[WindowInfo], x: i32, y: i32) -> Option<&WindowInfo> {
@@ -1039,8 +1083,12 @@ fn rect_intersection_area(
 #[cfg(test)]
 mod tests {
     use super::{
-        BRIDGE_BUNDLE_ID, hidden_bundle_ids, select_hide_candidates, to_app_refs, windows_to_change,
+        hidden_bundle_ids, is_window_allowed, select_hide_candidates, to_app_refs,
+        windows_to_change,
     };
+
+    const BRIDGE_BUNDLE_ID: &str = env!("CARGO_PKG_NAME");
+    use crate::desktop_apps::AliasIndex;
     use crate::model::{Rect, WindowInfo};
 
     fn test_window(id: &str, bundle_id: &str) -> WindowInfo {
@@ -1077,11 +1125,12 @@ mod tests {
 
     #[test]
     fn hide_responses_skip_bridge_windows() {
+        let idx = AliasIndex::default();
         let bridge = test_window("{bridge}", BRIDGE_BUNDLE_ID);
         let firefox = test_window("{firefox}", "firefox");
         let windows = vec![bridge, firefox];
 
-        let candidates = select_hide_candidates(&windows, None, &[], "claude");
+        let candidates = select_hide_candidates(&windows, None, &[], "claude", &idx);
 
         assert_eq!(candidates.len(), 2);
         assert!(candidates.iter().any(|window| window.id == "{bridge}"));
@@ -1090,10 +1139,39 @@ mod tests {
             windows_to_change(&candidates, true),
             vec!["{bridge}".to_owned(), "{firefox}".to_owned()]
         );
-        assert_eq!(hidden_bundle_ids(&candidates), vec!["firefox"]);
+        assert_eq!(hidden_bundle_ids(&candidates, &idx), vec!["firefox"]);
 
-        let preview = to_app_refs(&candidates);
+        let preview = to_app_refs(&candidates, &idx);
         assert_eq!(preview.len(), 1);
         assert_eq!(preview[0].bundle_id, "firefox");
+    }
+
+    #[test]
+    fn allowlist_matches_canonical_window_id_verbatim() {
+        // KCalc-shaped fixture: file stem `org.kde.kcalc`, StartupWMClass
+        // `kcalc`. Index ensures both forms canonicalize to `kcalc`.
+        let idx = AliasIndex::for_tests([
+            ("org.kde.kcalc", "kcalc"),
+            ("org.kde.kcalc.desktop", "kcalc"),
+            ("kcalc", "kcalc"),
+        ]);
+        let window = test_window("{kcalc}", "org.kde.kcalc");
+
+        // Canonical form wired through: a window reporting any KCalc alias
+        // matches an allowlist that contains the canonical `kcalc`.
+        let allowed = vec!["kcalc".to_owned()];
+        assert!(is_window_allowed(&window, &allowed, "claude", &idx));
+    }
+
+    #[test]
+    fn allowlist_rejects_non_canonical_aliases() {
+        // Same fixture, but the allowlist holds the FDO id instead of the
+        // canonical bundle id. Bridge does no input normalization, so this
+        // does NOT match — upstream is expected to send canonical ids.
+        let idx = AliasIndex::for_tests([("org.kde.kcalc", "kcalc"), ("kcalc", "kcalc")]);
+        let window = test_window("{kcalc}", "kcalc");
+
+        let allowed = vec!["org.kde.kcalc".to_owned()];
+        assert!(!is_window_allowed(&window, &allowed, "claude", &idx));
     }
 }

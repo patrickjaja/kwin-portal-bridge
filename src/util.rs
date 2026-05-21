@@ -1,3 +1,26 @@
+use std::sync::OnceLock;
+
+/// Lowercased identifiers that mark a window as belonging to this bridge
+/// process — including its teach and session overlays, which inherit the
+/// binary's `resourceClass` / `resourceName`. Includes both the cargo
+/// package name (compile-time) and the running executable's basename
+/// (runtime), since the binary can be renamed at install time.
+pub fn bridge_overlay_names() -> &'static [String] {
+    static NAMES: OnceLock<Vec<String>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        let mut names = vec![env!("CARGO_PKG_NAME").to_ascii_lowercase()];
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(stem) = exe.file_stem().and_then(|stem| stem.to_str())
+        {
+            let normalized = stem.trim().to_ascii_lowercase();
+            if !normalized.is_empty() && !names.contains(&normalized) {
+                names.push(normalized);
+            }
+        }
+        names
+    })
+}
+
 pub fn rects_intersect(
     ax: i32,
     ay: i32,

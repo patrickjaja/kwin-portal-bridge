@@ -14,6 +14,7 @@ use crate::model::{
     CursorPosition, DoctorReport, ExcludeUpdate, Rect, ScreenInfo, ToolPresence,
     WindowControlResult, WindowInfo,
 };
+use crate::util;
 
 const DBUS_TIMEOUT: Duration = Duration::from_secs(5);
 const SCRIPT_OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -274,8 +275,10 @@ fn unique_suffix() -> u128 {
 }
 
 fn render_script(dbus_addr: &str, script_body: &str) -> String {
+    let overlay_names_json =
+        serde_json::to_string(util::bridge_overlay_names()).unwrap_or_else(|_| "[]".to_owned());
     format!(
-        "{SCRIPT_HEADER}\nconst DBUS_DESTINATION = {dbus_addr:?};\nconst BRIDGE_PATH = {BRIDGE_PATH:?};\nconst BRIDGE_INTERFACE = {BRIDGE_INTERFACE:?};\n{script_body}\n"
+        "{SCRIPT_HEADER}\nconst DBUS_DESTINATION = {dbus_addr:?};\nconst BRIDGE_PATH = {BRIDGE_PATH:?};\nconst BRIDGE_INTERFACE = {BRIDGE_INTERFACE:?};\nconst BRIDGE_OVERLAY_NAMES = {overlay_names_json};\n{script_body}\n"
     )
 }
 
@@ -305,6 +308,27 @@ function bridgeResult(payload) {
 
 function bridgeError(message) {
     bridgeEmit("error", { message: message });
+}
+
+function bridgeIsOverlayWindow(window) {
+    if (!window) {
+        return false;
+    }
+    const candidates = [window.resourceClass, window.resourceName, window.desktopFileName];
+    for (let i = 0; i < candidates.length; i++) {
+        const raw = candidates[i];
+        if (!raw) {
+            continue;
+        }
+        let normalized = String(raw).trim().toLowerCase();
+        if (normalized.endsWith(".desktop")) {
+            normalized = normalized.slice(0, -8);
+        }
+        if (BRIDGE_OVERLAY_NAMES.indexOf(normalized) !== -1) {
+            return true;
+        }
+    }
+    return false;
 }
 
 function bridgeWindowAppRef(window, seenIds, depth) {
@@ -412,7 +436,11 @@ try {
 
 const SCRIPT_WINDOWS: &str = r#"
 try {
-    const windows = workspace.windowList().map((window, index) => ({
+    const windows = workspace.windowList().map((window, index) => {
+        if (bridgeIsOverlayWindow(window) && !window.excludeFromCapture) {
+            window.excludeFromCapture = true;
+        }
+        return {
         id: String(window.internalId),
         title: window.caption || "",
         geometry: bridgeRect(window.frameGeometry),
@@ -435,7 +463,8 @@ try {
         is_active: workspace.activeWindow === window,
         exclude_from_capture: !!window.excludeFromCapture,
         keep_above: typeof window.keepAbove === "boolean" ? window.keepAbove : null
-    }));
+        };
+    });
     bridgeResult(windows);
 } catch (error) {
     bridgeError(String(error));

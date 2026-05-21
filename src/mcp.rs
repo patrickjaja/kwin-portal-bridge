@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::capture::{png_base64_from_frame, resolve_screen};
 use crate::daemon::start_session_daemon;
-use crate::desktop_apps::DesktopAppService;
+use crate::desktop_apps::{AliasIndex, DesktopAppService};
 use crate::executor::ExecutorBackend;
 use crate::kwin::KWinBackend;
 use crate::model::{
@@ -331,6 +331,8 @@ impl McpServer {
     )]
     async fn list_running_apps(&self) -> Result<Json<RunningAppsResult>, McpError> {
         let kwin = KWinBackend::new();
+        let desktop_apps = DesktopAppService::new();
+        let idx = desktop_apps.alias_index().map_err(internal_error)?;
         let mut seen = HashSet::new();
         let mut apps = Vec::new();
 
@@ -342,7 +344,7 @@ impl McpServer {
                 continue;
             }
 
-            let app = app_ref_for_window(&window);
+            let app = app_ref_for_window(&window, &idx);
             if seen.insert(app.bundle_id.clone()) {
                 apps.push(app);
             }
@@ -362,6 +364,8 @@ impl McpServer {
     ) -> Result<Json<FindWindowsResult>, McpError> {
         let kwin = KWinBackend::new();
         let windows = kwin.list_windows().map_err(internal_error)?;
+        let desktop_apps = DesktopAppService::new();
+        let idx = desktop_apps.alias_index().map_err(internal_error)?;
 
         let bundle_id = request
             .bundle_id
@@ -377,7 +381,7 @@ impl McpServer {
             .into_iter()
             .filter(|window| {
                 if let Some(bundle_id) = bundle_id.as_ref()
-                    && !window_matches_bundle_id(window, bundle_id)
+                    && !window_matches_bundle_id(window, bundle_id, &idx)
                 {
                     return false;
                 }
@@ -594,35 +598,24 @@ fn internal_error(error: anyhow::Error) -> McpError {
     McpError::internal_error(error.to_string(), None)
 }
 
-fn window_matches_bundle_id(window: &WindowInfo, expected: &str) -> bool {
-    window.matches_bundle_id(expected)
+fn window_matches_bundle_id(window: &WindowInfo, expected: &str, idx: &AliasIndex) -> bool {
+    // MCP's find_windows lowercases inputs, so do the same on the window
+    // side; bundle ids out of the alias index are already lowercase.
+    window
+        .bundle_id(idx)
+        .map(|id| id == expected)
+        .unwrap_or(false)
 }
 
-fn app_ref_for_window(window: &WindowInfo) -> AppRef {
+fn app_ref_for_window(window: &WindowInfo, idx: &AliasIndex) -> AppRef {
     AppRef {
-        bundle_id: window_bundle_id(window).unwrap_or_else(|| window.id.clone()),
-        display_name: window_display_name(window),
+        bundle_id: window.bundle_id(idx).unwrap_or_else(|| window.id.clone()),
+        display_name: window.display_name(idx),
     }
-}
-
-fn window_bundle_id(window: &WindowInfo) -> Option<String> {
-    window.bundle_id()
-}
-
-fn normalize_optional_bundle_id(value: Option<&str>) -> Option<String> {
-    let value = value?.trim();
-    if value.is_empty() {
-        return None;
-    }
-
-    Some(value.strip_suffix(".desktop").unwrap_or(value).to_owned())
-}
-
-fn window_display_name(window: &WindowInfo) -> String {
-    window.display_name()
 }
 
 fn is_bridge_window(window: &WindowInfo) -> bool {
+    const BRIDGE_BUNDLE_ID: &str = env!("CARGO_PKG_NAME");
     [
         window.desktop_file_name.as_deref(),
         window.resource_class.as_deref(),
@@ -630,8 +623,14 @@ fn is_bridge_window(window: &WindowInfo) -> bool {
     ]
     .into_iter()
     .flatten()
-    .filter_map(|value| normalize_optional_bundle_id(Some(value)))
-    .any(|value| value == env!("CARGO_PKG_NAME"))
+    .map(|value| {
+        let trimmed = value.trim();
+        trimmed
+            .strip_suffix(".desktop")
+            .unwrap_or(trimmed)
+            .to_ascii_lowercase()
+    })
+    .any(|value| value == BRIDGE_BUNDLE_ID)
 }
 
 fn is_shell_window(window: &WindowInfo) -> bool {
