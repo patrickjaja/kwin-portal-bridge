@@ -144,7 +144,11 @@ impl AliasIndex {
         }
 
         let target_path = PathBuf::from(target);
-        if let Some(found) = self.entries.iter().find(|entry| entry.entry.path == target_path) {
+        if let Some(found) = self
+            .entries
+            .iter()
+            .find(|entry| entry.entry.path == target_path)
+        {
             return Ok(found);
         }
 

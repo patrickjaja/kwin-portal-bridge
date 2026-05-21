@@ -51,7 +51,8 @@ impl ExecutorBackend {
     pub fn frontmost_app(&self, kwin: &KWinBackend) -> Result<Option<AppRef>> {
         let idx = self.alias_index()?;
         let windows = kwin.list_windows()?;
-        Ok(frontmost_window_ignoring_bridge(&windows).map(|window| app_ref_for_window(window, &idx)))
+        Ok(frontmost_window_ignoring_bridge(&windows)
+            .map(|window| app_ref_for_window(window, &idx)))
     }
 
     pub fn app_under_point(&self, x: i32, y: i32, kwin: &KWinBackend) -> Result<Option<AppRef>> {
@@ -1167,10 +1168,7 @@ mod tests {
         // Same fixture, but the allowlist holds the FDO id instead of the
         // canonical bundle id. Bridge does no input normalization, so this
         // does NOT match — upstream is expected to send canonical ids.
-        let idx = AliasIndex::for_tests([
-            ("org.kde.kcalc", "kcalc"),
-            ("kcalc", "kcalc"),
-        ]);
+        let idx = AliasIndex::for_tests([("org.kde.kcalc", "kcalc"), ("kcalc", "kcalc")]);
         let window = test_window("{kcalc}", "kcalc");
 
         let allowed = vec!["org.kde.kcalc".to_owned()];

@@ -275,8 +275,8 @@ fn unique_suffix() -> u128 {
 }
 
 fn render_script(dbus_addr: &str, script_body: &str) -> String {
-    let overlay_names_json = serde_json::to_string(util::bridge_overlay_names())
-        .unwrap_or_else(|_| "[]".to_owned());
+    let overlay_names_json =
+        serde_json::to_string(util::bridge_overlay_names()).unwrap_or_else(|_| "[]".to_owned());
     format!(
         "{SCRIPT_HEADER}\nconst DBUS_DESTINATION = {dbus_addr:?};\nconst BRIDGE_PATH = {BRIDGE_PATH:?};\nconst BRIDGE_INTERFACE = {BRIDGE_INTERFACE:?};\nconst BRIDGE_OVERLAY_NAMES = {overlay_names_json};\n{script_body}\n"
     )
