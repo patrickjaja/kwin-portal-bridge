@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing git tag to release (e.g. v0.2.3)'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            artifact: kwin-portal-bridge-x86_64
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            artifact: kwin-portal-bridge-aarch64
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libpipewire-0.3-dev
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Stage artifact
+        run: |
+          mkdir -p staged
+          cp target/release/kwin-portal-bridge staged/${{ matrix.artifact }}
+          sha256sum staged/${{ matrix.artifact }} > staged/${{ matrix.artifact }}.sha256
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ matrix.artifact }}
+          path: staged/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Combined checksum manifest
+        run: |
+          cd dist
+          sha256sum kwin-portal-bridge-x86_64 kwin-portal-bridge-aarch64 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          files: |
+            dist/kwin-portal-bridge-x86_64
+            dist/kwin-portal-bridge-aarch64
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+          draft: true
+          generate_release_notes: true
