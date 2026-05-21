@@ -665,15 +665,8 @@ fn spawn_detached(command: &mut Command) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DesktopAppService, expand_exec_token, split_exec};
+    use super::{expand_exec_token, split_exec};
 
-    #[test]
-    fn launch_desktop_entry() {
-        let das = DesktopAppService::new();
-        let result = das.open_app("com.mitchellh.ghostty").unwrap();
-        println!("{:?}", result);
-        // launch_via_kio(&DesktopEntry::from_path(PathBuf::from("/usr/share/applications/systemsettings.desktop"), Some(&get_languages_from_env())).unwrap());
-    }
     #[test]
     fn split_exec_handles_quotes_and_escapes() {
         let parsed = split_exec(r#"app --flag "hello world" 'two words'"#).unwrap();
