@@ -1,6 +1,7 @@
 use std::io::Write;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -19,6 +20,12 @@ use crate::util;
 const DBUS_TIMEOUT: Duration = Duration::from_secs(5);
 const SCRIPT_OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const SCRIPT_OUTPUT_MAX_POLLS: usize = 20;
+// KWin applies `workspace.activeWindow = target` asynchronously, so the very
+// first verification read can still observe the previously-active window. Poll
+// a few times with a short settle delay before giving up (the activation
+// usually lands within one or two reads).
+const ACTIVATION_POLL_INTERVAL: Duration = Duration::from_millis(60);
+const ACTIVATION_MAX_POLLS: usize = 10;
 const BRIDGE_PATH: &str = "/Bridge";
 const BRIDGE_INTERFACE: &str = "org.kde.KWinPortalBridge";
 
@@ -90,20 +97,31 @@ impl KWinBackend {
 
         run_script("kwin-portal-bridge-activate", &script, false)?;
 
-        let activated = self
-            .list_windows()?
-            .into_iter()
-            .find(|window| window.is_active)
-            .ok_or_else(|| anyhow!("KWin did not report an active window after activation"))?;
+        // The activation above is asynchronous: KWin may not have switched the
+        // active window by the time the next read returns. Poll until the
+        // requested window (or one of its transient children) becomes active,
+        // rather than bailing on the first mismatch.
+        let mut last_active: Option<String> = None;
+        for attempt in 0..ACTIVATION_MAX_POLLS {
+            if attempt > 0 {
+                thread::sleep(ACTIVATION_POLL_INTERVAL);
+            }
 
-        if activated.id != window_id && !activated.is_transient_for_window(window_id) {
-            bail!(
-                "KWin activated `{}`, but `{window_id}` was requested",
-                activated.id
-            );
+            if let Some(active) = self.list_windows()?.into_iter().find(|window| window.is_active) {
+                if active.id == window_id || active.is_transient_for_window(window_id) {
+                    return Ok(());
+                }
+                last_active = Some(active.id);
+            }
         }
 
-        Ok(())
+        match last_active {
+            Some(active_id) => bail!(
+                "KWin activated `{active_id}`, but `{window_id}` was requested \
+                 (after {ACTIVATION_MAX_POLLS} attempts)"
+            ),
+            None => bail!("KWin did not report an active window after activation"),
+        }
     }
 
     pub fn set_window_geometry(
