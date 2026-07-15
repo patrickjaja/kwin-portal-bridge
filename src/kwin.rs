@@ -1,6 +1,7 @@
 use std::io::Write;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -19,6 +20,12 @@ use crate::util;
 const DBUS_TIMEOUT: Duration = Duration::from_secs(5);
 const SCRIPT_OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const SCRIPT_OUTPUT_MAX_POLLS: usize = 20;
+// KWin applies `workspace.activeWindow = target` asynchronously, so the very
+// first verification read can still observe the previously-active window. Poll
+// a few times with a short settle delay before giving up (the activation
+// usually lands within one or two reads).
+const ACTIVATION_POLL_INTERVAL: Duration = Duration::from_millis(60);
+const ACTIVATION_MAX_POLLS: usize = 10;
 const BRIDGE_PATH: &str = "/Bridge";
 const BRIDGE_INTERFACE: &str = "org.kde.KWinPortalBridge";
 
@@ -63,9 +70,10 @@ impl KWinBackend {
         }
 
         let args_json = serde_json::to_string(windows)?;
+        // SCRIPT_HEADER is prepended by render_script (along with the bridge
+        // constants), so the body only carries its own inputs and logic.
         let script = format!(
-            "{}\nconst TARGET_WINDOWS = {args_json};\nconst TARGET_VALUE = {};\n{}",
-            SCRIPT_HEADER, value, SCRIPT_SET_EXCLUDE
+            "const TARGET_WINDOWS = {args_json};\nconst TARGET_VALUE = {value};\n{SCRIPT_SET_EXCLUDE}"
         );
 
         let payload = run_json_script("kwin-portal-bridge-exclude", &script)?;
@@ -83,27 +91,39 @@ impl KWinBackend {
     }
 
     pub fn activate_window(&self, window_id: &str) -> Result<()> {
-        let script = format!(
-            "{}\nconst TARGET_WINDOW = {:?};\n{}",
-            SCRIPT_HEADER, window_id, SCRIPT_ACTIVATE_WINDOW
-        );
+        let script = format!("const TARGET_WINDOW = {window_id:?};\n{SCRIPT_ACTIVATE_WINDOW}");
 
         run_script("kwin-portal-bridge-activate", &script, false)?;
 
-        let activated = self
-            .list_windows()?
-            .into_iter()
-            .find(|window| window.is_active)
-            .ok_or_else(|| anyhow!("KWin did not report an active window after activation"))?;
+        // The activation above is asynchronous: KWin may not have switched the
+        // active window by the time the next read returns. Poll until the
+        // requested window (or one of its transient children) becomes active,
+        // rather than bailing on the first mismatch.
+        let mut last_active: Option<String> = None;
+        for attempt in 0..ACTIVATION_MAX_POLLS {
+            if attempt > 0 {
+                thread::sleep(ACTIVATION_POLL_INTERVAL);
+            }
 
-        if activated.id != window_id && !activated.is_transient_for_window(window_id) {
-            bail!(
-                "KWin activated `{}`, but `{window_id}` was requested",
-                activated.id
-            );
+            if let Some(active) = self
+                .list_windows()?
+                .into_iter()
+                .find(|window| window.is_active)
+            {
+                if active.id == window_id || active.is_transient_for_window(window_id) {
+                    return Ok(());
+                }
+                last_active = Some(active.id);
+            }
         }
 
-        Ok(())
+        match last_active {
+            Some(active_id) => bail!(
+                "KWin activated `{active_id}`, but `{window_id}` was requested \
+                 (after {ACTIVATION_MAX_POLLS} attempts)"
+            ),
+            None => bail!("KWin did not report an active window after activation"),
+        }
     }
 
     pub fn set_window_geometry(
@@ -113,8 +133,8 @@ impl KWinBackend {
     ) -> Result<WindowControlResult> {
         let geometry_json = serde_json::to_string(geometry)?;
         let script = format!(
-            "{}\nconst TARGET_WINDOW = {:?};\nconst TARGET_GEOMETRY = {};\n{}",
-            SCRIPT_HEADER, window_id, geometry_json, SCRIPTS.set_window_geometry
+            "const TARGET_WINDOW = {window_id:?};\nconst TARGET_GEOMETRY = {geometry_json};\n{}",
+            SCRIPTS.set_window_geometry
         );
 
         let payload = run_json_script("kwin-portal-bridge-set-window-geometry", &script)?;
@@ -127,8 +147,8 @@ impl KWinBackend {
         value: bool,
     ) -> Result<WindowControlResult> {
         let script = format!(
-            "{}\nconst TARGET_WINDOW = {:?};\nconst TARGET_VALUE = {};\n{}",
-            SCRIPT_HEADER, window_id, value, SCRIPTS.set_window_keep_above
+            "const TARGET_WINDOW = {window_id:?};\nconst TARGET_VALUE = {value};\n{}",
+            SCRIPTS.set_window_keep_above
         );
 
         let payload = run_json_script("kwin-portal-bridge-set-window-keep-above", &script)?;
@@ -277,8 +297,15 @@ fn unique_suffix() -> u128 {
 fn render_script(dbus_addr: &str, script_body: &str) -> String {
     let overlay_names_json =
         serde_json::to_string(util::bridge_overlay_names()).unwrap_or_else(|_| "[]".to_owned());
+    // The `const` declarations must precede SCRIPT_HEADER: KWin's QJSEngine
+    // treats these bindings as living in the Temporal Dead Zone until their
+    // declaration line, and it rejects the header functions (e.g. bridgeEmit)
+    // that close over DBUS_DESTINATION with "Variable 'DBUS_DESTINATION' is
+    // used before its declaration" if the functions are parsed first. Emitting
+    // the constants up front is safe because SCRIPT_HEADER contains only
+    // function declarations, so none of them execute before the consts exist.
     format!(
-        "{SCRIPT_HEADER}\nconst DBUS_DESTINATION = {dbus_addr:?};\nconst BRIDGE_PATH = {BRIDGE_PATH:?};\nconst BRIDGE_INTERFACE = {BRIDGE_INTERFACE:?};\nconst BRIDGE_OVERLAY_NAMES = {overlay_names_json};\n{script_body}\n"
+        "const DBUS_DESTINATION = {dbus_addr:?};\nconst BRIDGE_PATH = {BRIDGE_PATH:?};\nconst BRIDGE_INTERFACE = {BRIDGE_INTERFACE:?};\nconst BRIDGE_OVERLAY_NAMES = {overlay_names_json};\n{SCRIPT_HEADER}\n{script_body}\n"
     )
 }
 
@@ -581,3 +608,30 @@ try {
     bridgeError(String(error));
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression guard for https://github.com/mosi0815/kwin-portal-bridge/issues/1:
+    // KWin's QJSEngine rejects the header with "Variable 'DBUS_DESTINATION' is
+    // used before its declaration" unless the bridge constants are declared
+    // ahead of the header functions that close over them.
+    #[test]
+    fn const_declarations_precede_header_usage() {
+        let script = render_script(":1.42", "bridgeResult({ ok: true });");
+
+        let decl = script
+            .find("const DBUS_DESTINATION")
+            .expect("DBUS_DESTINATION must be declared");
+        let first_use = script
+            .find("bridgeEmit")
+            .expect("header must reference DBUS_DESTINATION via bridgeEmit");
+
+        assert!(
+            decl < first_use,
+            "const DBUS_DESTINATION (at {decl}) must be declared before the header \
+             functions that use it (first bridgeEmit at {first_use})"
+        );
+    }
+}
