@@ -705,15 +705,44 @@ fn activate_visible_windows_in_z_order(
     let activatable: Vec<_> = visible_windows
         .into_iter()
         .filter(|window| is_window_allowed(window, allowed_bundle_ids, host_bundle_id, idx))
+        .filter(|window| is_activatable_window(window))
         .collect();
 
     let mut activated = None;
     for window in activatable {
-        kwin.activate_window(&window.id)?;
-        activated = bundle_id_for_window(window, idx);
+        // Raising allowed apps above disallowed ones is best-effort. KWin
+        // silently ignores `workspace.activeWindow = target` for surfaces it
+        // refuses to focus (e.g. a plasmashell containment / OSD that slipped
+        // past the shell filter), which makes activate_window time out. That
+        // must not abort the whole prepare-for-action step and block the
+        // screenshot, so log and keep going instead of propagating the error.
+        match kwin.activate_window(&window.id) {
+            Ok(()) => activated = bundle_id_for_window(window, idx),
+            Err(error) => {
+                eprintln!(
+                    "[kwin-portal-bridge] skipping non-activatable window {}: {error:#}",
+                    window.id
+                );
+            }
+        }
     }
 
     Ok(activated)
+}
+
+/// Whether KWin will accept `workspace.activeWindow = window`. Desktop,
+/// dock, and shell surfaces are already excluded upstream; this additionally
+/// drops utility/OSD/notification surfaces (plasmashell spawns several) that
+/// report neither normal-window nor dialog and which KWin refuses to focus.
+/// When KWin reports neither flag we assume activatable to stay conservative.
+fn is_activatable_window(window: &WindowInfo) -> bool {
+    if is_shell_window(window) {
+        return false;
+    }
+    !matches!(
+        (window.is_normal_window, window.is_dialog),
+        (Some(false), Some(false))
+    )
 }
 
 fn to_app_refs(windows: &[&WindowInfo], idx: &AliasIndex) -> Vec<AppRef> {
@@ -1083,8 +1112,8 @@ fn rect_intersection_area(
 #[cfg(test)]
 mod tests {
     use super::{
-        hidden_bundle_ids, is_window_allowed, select_hide_candidates, to_app_refs,
-        windows_to_change,
+        hidden_bundle_ids, is_activatable_window, is_window_allowed, select_hide_candidates,
+        to_app_refs, windows_to_change,
     };
 
     const BRIDGE_BUNDLE_ID: &str = env!("CARGO_PKG_NAME");
@@ -1121,6 +1150,40 @@ mod tests {
             exclude_from_capture: false,
             keep_above: Some(false),
         }
+    }
+
+    #[test]
+    fn plasmashell_osd_surface_is_not_activation_target() {
+        // Regression guard for the mosi0815/kwin-portal-bridge#1 failure:
+        // plasmashell is on the allowlist and spawns non-normal, non-dialog
+        // surfaces (OSD/notification/containment) that KWin refuses to focus.
+        // Trying to activate one makes prepare-for-action time out, so such
+        // surfaces must be excluded from the activation set.
+        let mut osd = test_window("{osd}", "org.kde.plasmashell");
+        osd.is_normal_window = Some(false);
+        osd.is_dialog = Some(false);
+        assert!(!is_activatable_window(&osd));
+
+        // A regular application window stays activatable.
+        let app = test_window("{firefox}", "firefox");
+        assert!(is_activatable_window(&app));
+
+        // A dialog stays activatable.
+        let mut dialog = test_window("{dialog}", "firefox");
+        dialog.is_normal_window = Some(false);
+        dialog.is_dialog = Some(true);
+        assert!(is_activatable_window(&dialog));
+
+        // Unknown flags stay conservative (assume activatable).
+        let mut unknown = test_window("{unknown}", "firefox");
+        unknown.is_normal_window = None;
+        unknown.is_dialog = None;
+        assert!(is_activatable_window(&unknown));
+
+        // Docks/desktop shells are never activation targets.
+        let mut dock = test_window("{panel}", "org.kde.plasmashell");
+        dock.is_dock = Some(true);
+        assert!(!is_activatable_window(&dock));
     }
 
     #[test]
