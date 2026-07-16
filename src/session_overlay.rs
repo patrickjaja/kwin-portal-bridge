@@ -78,8 +78,12 @@ impl SessionOverlayProcess {
             return Ok(());
         }
 
-        self.shutdown();
+        // Spawn the replacement before killing the old overlay: the reverse
+        // order leaves `self` holding a dead child but the old `output` value
+        // when spawn fails, so a later retry with that value would no-op and
+        // the consent indicator would stay gone for the rest of the session.
         let replacement = Self::spawn(output)?;
+        self.shutdown();
         *self = replacement;
         Ok(())
     }
@@ -100,7 +104,11 @@ pub fn run(output: Option<&str>) -> Result<()> {
                 size: Some((0, 0)),
                 anchor: Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right,
                 layer: Layer::Overlay,
-                exclusive_zone: 0,
+                // -1 = ignore other surfaces' exclusive zones: with 0 the
+                // compositor shrinks this surface to fit around panels, so
+                // the glow stops at the plasma bar instead of framing the
+                // whole screen.
+                exclusive_zone: -1,
                 keyboard_interactivity: KeyboardInteractivity::None,
                 start_mode,
                 events_transparent: true,

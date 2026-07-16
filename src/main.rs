@@ -73,9 +73,6 @@ async fn main() -> Result<()> {
             stop_session_daemon().await?;
             print_json(&serde_json::json!({ "ended": true }))?;
         }
-        Command::Doctor => {
-            print_json(&kwin().doctor()?)?;
-        }
         Command::Screens => {
             print_json(&kwin().list_screens()?)?;
         }
@@ -84,9 +81,6 @@ async fn main() -> Result<()> {
         }
         Command::CursorPosition => {
             print_json(&kwin().cursor_position()?)?;
-        }
-        Command::SetExclude { windows, value } => {
-            print_json(&kwin().set_exclude_from_capture(&windows, value)?)?;
         }
         Command::SetWindowGeometry {
             window,
@@ -181,71 +175,6 @@ async fn main() -> Result<()> {
                     .await?,
             )?;
         }
-        Command::RaiseAllowedAtPoint {
-            allowed_bundle_ids,
-            host_bundle_id,
-            x,
-            y,
-        } => {
-            let kwin = kwin();
-            print_json(&executor()?.raise_allowed_window_at_point(
-                &allowed_bundle_ids,
-                &host_bundle_id,
-                x,
-                y,
-                &kwin,
-            )?)?;
-        }
-        Command::Click {
-            allowed_bundle_ids,
-            host_bundle_id,
-            modifiers,
-            x,
-            y,
-            button,
-            count,
-        } => {
-            let kwin = kwin();
-            print_json(
-                &executor()?
-                    .click(
-                        &allowed_bundle_ids,
-                        &host_bundle_id,
-                        x,
-                        y,
-                        &button,
-                        count,
-                        &modifiers,
-                        &portal(),
-                        &kwin,
-                    )
-                    .await?,
-            )?;
-        }
-        Command::Scroll {
-            allowed_bundle_ids,
-            host_bundle_id,
-            x,
-            y,
-            dx,
-            dy,
-        } => {
-            let kwin = kwin();
-            print_json(
-                &executor()?
-                    .scroll(
-                        &allowed_bundle_ids,
-                        &host_bundle_id,
-                        x,
-                        y,
-                        dx,
-                        dy,
-                        &portal(),
-                        &kwin,
-                    )
-                    .await?,
-            )?;
-        }
         Command::KeySequence { keys, repeat } => {
             print_json(&executor()?.key_sequence(&keys, repeat, &portal()).await?)?;
         }
@@ -260,30 +189,6 @@ async fn main() -> Result<()> {
         }
         Command::WriteClipboard { text } => {
             print_json(&portal().write_clipboard(&text).await?)?;
-        }
-        Command::Drag {
-            allowed_bundle_ids,
-            host_bundle_id,
-            from_x,
-            from_y,
-            to_x,
-            to_y,
-        } => {
-            let kwin = kwin();
-            print_json(
-                &executor()?
-                    .drag(
-                        &allowed_bundle_ids,
-                        &host_bundle_id,
-                        from_x,
-                        from_y,
-                        to_x,
-                        to_y,
-                        &portal(),
-                        &kwin,
-                    )
-                    .await?,
-            )?;
         }
         Command::LeftMouseDown => {
             print_json(&portal().left_mouse_down().await?)?;
@@ -308,28 +213,6 @@ async fn main() -> Result<()> {
             let kwin = kwin();
             print_json(&executor()?.restore_prepare_state(&kwin)?)?;
         }
-        Command::ResolvePrepareCapture {
-            allowed_bundle_ids,
-            host_bundle_id,
-            display,
-            do_hide,
-        } => {
-            let kwin = kwin();
-            let capture = capture();
-            print_json(
-                &executor()?
-                    .resolve_prepare_capture(
-                        &allowed_bundle_ids,
-                        &host_bundle_id,
-                        display.as_deref(),
-                        do_hide,
-                        &capture,
-                        &portal(),
-                        &kwin,
-                    )
-                    .await?,
-            )?;
-        }
         Command::Screenshot { display } => {
             let capture = capture();
             let kwin = kwin();
@@ -353,28 +236,6 @@ async fn main() -> Result<()> {
                     .capture_zoom(display.as_deref(), x, y, w, h, &portal(), &kwin)
                     .await?,
             )?;
-        }
-        Command::PortalSession => {
-            print_json(&portal().create_session().await?)?;
-        }
-        Command::MouseMove { x, y, stream } => {
-            print_json(&portal().move_pointer_absolute(stream, x, y).await?)?;
-        }
-        Command::MouseButton { button, pressed } => {
-            print_json(&portal().pointer_button(button, pressed).await?)?;
-        }
-        Command::Key { keycode, pressed } => {
-            print_json(&portal().keyboard_keycode(keycode, pressed).await?)?;
-        }
-        Command::PipewireFrame {
-            stream,
-            poke_pointer,
-        } => {
-            print_json(&portal().read_first_frame(stream, poke_pointer).await?)?;
-        }
-        Command::SavePng { stream, output } => {
-            let capture = capture();
-            print_json(&capture.save_png(&portal(), stream, &output).await?)?;
         }
         Command::ServeSession { socket } => {
             serve_session_daemon(std::path::PathBuf::from(socket)).await?;
@@ -413,7 +274,14 @@ async fn main() -> Result<()> {
         } => {
             let payload: TeachStepPayload =
                 serde_json::from_str(&payload).context("failed to decode teach preview payload")?;
-            preview_teach_overlay(payload, display, working, auto_exit_ms)?;
+            // Run the blocking iced app on a plain thread: on exit it drops
+            // its internal tokio runtime, which panics inside this
+            // #[tokio::main] context.
+            std::thread::spawn(move || {
+                preview_teach_overlay(payload, display, working, auto_exit_ms)
+            })
+            .join()
+            .map_err(|_| anyhow::anyhow!("teach overlay preview panicked"))??;
         }
     }
 

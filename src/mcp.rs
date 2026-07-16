@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
     handler::server::wrapper::{Json, Parameters},
-    model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
+    model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo},
     schemars::JsonSchema,
     tool, tool_handler, tool_router,
     transport::stdio,
@@ -282,7 +282,8 @@ impl McpServer {
         };
         let structured_content =
             serde_json::to_value(metadata).map_err(|error| internal_error(error.into()))?;
-        let mut result = CallToolResult::success(vec![Content::image(png_base64, "image/png")]);
+        let mut result =
+            CallToolResult::success(vec![ContentBlock::image(png_base64, "image/png")]);
         result.structured_content = Some(structured_content);
 
         Ok(result)

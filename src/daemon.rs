@@ -29,30 +29,22 @@ use std::os::unix::process::CommandExt;
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 
+/// Upper bound for reading a request from / writing a response to one IPC
+/// client. Connections are serviced sequentially, so without this a single
+/// stalled client freezes the daemon (including SIGTERM handling).
+const IPC_IO_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SessionRequest {
     SessionInfo,
     Shutdown,
-    MovePointerAbsolute {
-        stream: Option<u32>,
-        x: f64,
-        y: f64,
-    },
     MovePointerScreenPoint {
         screen: ScreenInfo,
         x: i32,
         y: i32,
     },
-    PointerButton {
-        button: i32,
-        pressed: bool,
-    },
     LeftMouseDown,
     LeftMouseUp,
-    KeyboardKeycode {
-        keycode: i32,
-        pressed: bool,
-    },
     TypeText {
         text: String,
         delay_ms: u64,
@@ -265,9 +257,32 @@ pub async fn serve_open_session(
                 }
                 accepted = listener.accept() => {
                     let (mut stream, _) = accepted.context("failed to accept IPC client")?;
-                    let request = read_request(&mut stream).await?;
+                    // A misbehaving client must never take down the session:
+                    // the daemon's own stale-socket probe connects and
+                    // immediately hangs up, and any caller can send garbage or
+                    // stall mid-request. Time-limit both directions and log
+                    // instead of propagating.
+                    let request = match tokio::time::timeout(IPC_IO_TIMEOUT, read_request(&mut stream)).await {
+                        Ok(Ok(request)) => request,
+                        Ok(Err(error)) => {
+                            eprintln!("[kwin-portal-bridge] ignoring invalid IPC request: {error:#}");
+                            continue;
+                        }
+                        Err(_) => {
+                            eprintln!("[kwin-portal-bridge] IPC client timed out sending its request");
+                            continue;
+                        }
+                    };
                     let (response, should_shutdown) = handle_request(&mut session, &mut overlay, request).await;
-                    write_response(&mut stream, response).await?;
+                    match tokio::time::timeout(IPC_IO_TIMEOUT, write_response(&mut stream, response)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            eprintln!("[kwin-portal-bridge] failed to write IPC response: {error:#}");
+                        }
+                        Err(_) => {
+                            eprintln!("[kwin-portal-bridge] IPC client timed out reading the response");
+                        }
+                    }
                     if should_shutdown {
                         break;
                     }
@@ -278,10 +293,17 @@ pub async fn serve_open_session(
     }
     .await;
 
-    restore_prepare_state().ok();
+    // Teardown stays best-effort, but a failed portal-session shutdown is
+    // exactly the orphaned-session mode this daemon exists to avoid, so at
+    // least leave a trace of what went wrong.
+    if let Err(error) = restore_prepare_state() {
+        eprintln!("[kwin-portal-bridge] failed to restore hidden windows on shutdown: {error:#}");
+    }
     teach_overlay.shutdown();
     overlay.shutdown();
-    session.shutdown().await.ok();
+    if let Err(error) = session.shutdown().await {
+        eprintln!("[kwin-portal-bridge] failed to shut down portal session: {error:#}");
+    }
     std::fs::remove_file(&socket).ok();
     serve_result
 }
@@ -387,20 +409,11 @@ async fn handle_request(
                 true,
             );
         }
-        SessionRequest::MovePointerAbsolute { stream, x, y } => {
-            respond_async(session.move_pointer_absolute(stream, x, y).await)
-        }
         SessionRequest::MovePointerScreenPoint { screen, x, y } => {
             respond_async(session.move_pointer_screen_point(&screen, x, y).await)
         }
-        SessionRequest::PointerButton { button, pressed } => {
-            respond_async(session.pointer_button(button, pressed).await)
-        }
         SessionRequest::LeftMouseDown => respond_async(session.left_mouse_down().await),
         SessionRequest::LeftMouseUp => respond_async(session.left_mouse_up().await),
-        SessionRequest::KeyboardKeycode { keycode, pressed } => {
-            respond_async(session.keyboard_keycode(keycode, pressed).await)
-        }
         SessionRequest::TypeText { text, delay_ms } => {
             respond_async(session.type_text(&text, delay_ms).await)
         }

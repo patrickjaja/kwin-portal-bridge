@@ -195,17 +195,6 @@ pub struct PrepareActionResult {
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RaiseWindowAtPointResult {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub topmost: Option<AppRef>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub raised: Option<AppRef>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub blocked_by: Option<AppRef>,
-}
-
-#[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "mcp", derive(JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct PointerActionResult {
@@ -280,23 +269,6 @@ pub struct ButtonStateResult {
     pub was_held: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ResolvePrepareCaptureResult {
-    pub base64: String,
-    pub width: u32,
-    pub height: u32,
-    pub display_width: u32,
-    pub display_height: u32,
-    pub display_id: String,
-    pub origin_x: i32,
-    pub origin_y: i32,
-    pub hidden: Vec<String>,
-    pub activated: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub capture_error: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "mcp", derive(JsonSchema))]
 #[serde(rename_all = "camelCase")]
@@ -315,18 +287,6 @@ pub struct OpenAppResult {
     pub display_name: String,
     pub path: String,
     pub launcher: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ToolPresence {
-    pub command: String,
-    pub available: bool,
-    pub path: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct DoctorReport {
-    pub tools: Vec<ToolPresence>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -358,42 +318,9 @@ pub struct PortalActionResult {
     pub target_stream: Option<StreamSelection>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct FrameProbeResult {
-    pub session: PortalSessionInfo,
-    pub target_stream: StreamSelection,
-    pub frame: FrameInfo,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct FrameInfo {
-    pub frame_id: u64,
-    pub width: u32,
-    pub height: u32,
-    pub stride: u32,
-    pub format: String,
-    pub buffer_kind: String,
-    pub bytes: Option<usize>,
-    pub dmabuf_planes: Option<usize>,
-    pub flags: u32,
-    pub damage_regions: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SavedImageResult {
-    pub path: String,
-    pub width: u32,
-    pub height: u32,
-    pub format: String,
-    pub bytes: usize,
-}
-
 #[derive(Debug, Clone)]
 pub struct CapturedFrame {
-    pub session: PortalSessionInfo,
-    pub target_stream: StreamSelection,
     pub frame: lamco_pipewire::VideoFrame,
-    pub frame_byte_len: usize,
 }
 
 #[cfg(test)]

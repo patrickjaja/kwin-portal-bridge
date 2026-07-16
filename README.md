@@ -42,12 +42,9 @@ Things to keep in mind before pointing it at anything important:
   query the frontmost app, find the topmost app under a point, set
   geometry, toggle keep-above, activate windows.
 - **`excludeFromCapture` enforcement.** Before a screenshot or action,
-  disallowed apps are hidden from capture and restored immediately
-  after — implemented as a persistent "prepare / restore" transaction
-  so partial failures don't leak other windows' contents.
-- **Allowlist-aware clicks, scrolls, and drags.** If a disallowed app
-  is covering the target point, the bridge raises the topmost allowed
-  app at that point before acting, mirroring the upstream behavior.
+  disallowed apps are hidden from capture via a `prepare-for-action`
+  transaction and restored immediately after, so partial failures
+  don't leak other windows' contents.
 - **Long-lived portal session daemon.** One portal consent prompt per
   tool-use lock instead of one per action. The session is held open by
   a background daemon and torn down cleanly on exit.
@@ -61,9 +58,6 @@ Things to keep in mind before pointing it at anything important:
   active computer-use session without obscuring content.
 - **Standalone MCP server** mode for wiring the bridge directly into
   any MCP-capable client (see caveats above).
-- **`doctor` subcommand** that reports which desktop integration bits
-  are actually available on the current machine, so you can see why
-  something isn't working without spelunking through logs.
 
 ## Requirements
 
@@ -89,7 +83,6 @@ That's the supported path.
 For quick local tinkering:
 
 ```sh
-kwin-portal-bridge doctor          # see what's available
 kwin-portal-bridge screens         # enumerate displays
 kwin-portal-bridge windows         # enumerate windows
 kwin-portal-bridge screenshot      # capture the current screen

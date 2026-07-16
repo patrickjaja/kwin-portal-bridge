@@ -1,8 +1,7 @@
 use std::io::Cursor;
-use std::path::Path;
 
 use crate::kwin::KWinBackend;
-use crate::model::{SavedImageResult, ScreenInfo, ScreenshotCapture, ScreenshotResult};
+use crate::model::{ScreenInfo, ScreenshotCapture, ScreenshotResult};
 use crate::portal::PortalBackend;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -52,34 +51,6 @@ impl CaptureBackend {
         let screens = kwin.list_screens()?;
         let screen = resolve_screen(&screens, display)?;
         portal.capture_zoom_image(screen, x, y, w, h).await
-    }
-
-    pub async fn save_png(
-        &self,
-        portal: &PortalBackend,
-        stream: Option<u32>,
-        output: &str,
-    ) -> Result<SavedImageResult> {
-        let captured = portal.capture_raw_frame(stream).await?;
-        let rgba = rgba_from_frame(&captured.frame)?;
-        let image = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(
-            captured.frame.width,
-            captured.frame.height,
-            rgba,
-        )
-        .ok_or_else(|| anyhow::anyhow!("failed to construct RGBA image buffer"))?;
-
-        image
-            .save(Path::new(output))
-            .with_context(|| format!("failed to save PNG to `{output}`"))?;
-
-        Ok(SavedImageResult {
-            path: output.to_owned(),
-            width: captured.frame.width,
-            height: captured.frame.height,
-            format: format!("{:?}", captured.frame.format),
-            bytes: captured.frame_byte_len,
-        })
     }
 }
 
@@ -138,6 +109,33 @@ pub(crate) fn zoom_result_from_frame(
     )
 }
 
+/// The row loops below index the producer-supplied buffer with
+/// producer-supplied dimensions; a short or mis-strided PipeWire frame must
+/// fail cleanly instead of panicking inside the daemon's serve task (which
+/// would skip session cleanup entirely).
+fn validate_frame_layout(bytes: &[u8], width: usize, height: usize, stride: usize) -> Result<()> {
+    if width == 0 || height == 0 {
+        bail!("frame has zero dimension ({width}x{height})");
+    }
+    let row_bytes = width
+        .checked_mul(4)
+        .context("frame width overflows row size")?;
+    if stride < row_bytes {
+        bail!("frame stride {stride} is smaller than row size {row_bytes}");
+    }
+    let required = (height - 1)
+        .checked_mul(stride)
+        .and_then(|offset| offset.checked_add(row_bytes))
+        .context("frame dimensions overflow buffer size")?;
+    if bytes.len() < required {
+        bail!(
+            "frame buffer holds {} bytes but {width}x{height} with stride {stride} requires {required}",
+            bytes.len()
+        );
+    }
+    Ok(())
+}
+
 fn rgba_from_frame(frame: &VideoFrame) -> Result<Vec<u8>> {
     let bytes = match &frame.buffer {
         FrameBuffer::Memory(data) => data.as_ref(),
@@ -147,6 +145,7 @@ fn rgba_from_frame(frame: &VideoFrame) -> Result<Vec<u8>> {
     let width = frame.width as usize;
     let height = frame.height as usize;
     let stride = frame.stride as usize;
+    validate_frame_layout(bytes, width, height, stride)?;
     let mut rgba = vec![0u8; width * height * 4];
 
     for y in 0..height {
@@ -201,6 +200,7 @@ fn rgb_from_frame(frame: &VideoFrame) -> Result<RgbImage> {
     let width = frame.width as usize;
     let height = frame.height as usize;
     let stride = frame.stride as usize;
+    validate_frame_layout(bytes, width, height, stride)?;
     let mut rgb = vec![0u8; width * height * 3];
 
     for y in 0..height {

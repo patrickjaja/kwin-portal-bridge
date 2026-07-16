@@ -128,13 +128,23 @@ impl TeachOverlayProcess {
             });
         }
 
-        let child = command
+        let mut child = command
             .spawn()
             .context("failed to spawn teach overlay controller")?;
 
         let deadline = Instant::now() + Duration::from_secs(3);
         while !socket.exists() {
+            if let Ok(Some(status)) = child.try_wait() {
+                bail!(
+                    "teach overlay controller exited during startup ({status}); see `{}`",
+                    log_path()?.display()
+                );
+            }
             if Instant::now() >= deadline {
+                // Don't leave the still-running child behind as a zombie the
+                // long-lived daemon will never reap.
+                child.kill().ok();
+                child.wait().ok();
                 bail!("teach overlay controller did not create its socket in time");
             }
             thread::sleep(Duration::from_millis(50));
@@ -467,7 +477,11 @@ impl TeachOverlayService {
         payload: TeachStepPayload,
         display: Option<String>,
     ) -> Result<mpsc::Receiver<TeachOverlayAction>> {
-        if let Some(display) = display {
+        // The anchor names the thing this step points at, so the bubble must
+        // be on the screen containing it — callers only guess (the desktop
+        // app falls back to its own window's screen), and a bubble on the
+        // wrong screen also silently drops its anchor.
+        if let Some(display) = display_for_anchor(payload.anchor_logical.as_ref()).or(display) {
             self.set_display(display)?;
         }
 
@@ -477,7 +491,10 @@ impl TeachOverlayService {
                 .shared
                 .lock()
                 .expect("teach overlay state mutex poisoned");
-            resolve_pending_locked(&mut state, "exit");
+            // A superseded step is not a user abort — keep "exit" reserved for
+            // the user actually leaving so overlapping controllers can tell
+            // the difference.
+            resolve_pending_locked(&mut state, "superseded");
             state.mode = TeachVisualMode::Step;
             state.last_payload = Some(payload);
             rebuild_resolved_payload(&mut state);
@@ -554,9 +571,17 @@ impl TeachOverlayService {
     }
 
     fn ensure_runner(&mut self) -> Result<()> {
-        if self.runner.is_some() {
+        // A runner whose thread already exited (e.g. Wayland/layer-shell init
+        // failure) must not count as running, or every later show-step blocks
+        // forever on a pending step no UI will ever resolve.
+        if self
+            .runner
+            .as_ref()
+            .is_some_and(|runner| !runner.join_handle.is_finished())
+        {
             return Ok(());
         }
+        self.stop_runner();
 
         let display = self
             .shared
@@ -636,6 +661,16 @@ fn resolve_payload(payload: &TeachStepPayload, display: Option<&str>) -> TeachSt
     }
 }
 
+fn display_for_anchor(anchor: Option<&TeachAnchorLogical>) -> Option<String> {
+    let anchor = anchor?;
+    let kwin = KWinBackend::new();
+    kwin.list_screens()
+        .ok()?
+        .into_iter()
+        .find(|screen| crate::portal::point_in_screen(screen, anchor.x, anchor.y))
+        .map(|screen| screen.id)
+}
+
 fn localize_anchor(anchor: &TeachAnchorLogical, display: &str) -> Option<TeachAnchorLogical> {
     let kwin = KWinBackend::new();
     let screen = kwin
@@ -672,6 +707,19 @@ impl TeachOverlayRunner {
 
     fn stop(self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        // The UI thread only exits after closing its window; if the surface
+        // never mapped (e.g. a nonexistent output name) it would never
+        // terminate, and callers hold the service mutex while stopping — an
+        // unbounded join here bricks the whole teach socket. Wait a bounded
+        // time, then detach as a last resort.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !self.join_handle.is_finished() {
+            if Instant::now() >= deadline {
+                eprintln!("[teach-overlay] runner did not shut down in time; detaching its thread");
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
         self.join_handle.join().ok();
     }
 }
@@ -700,7 +748,11 @@ fn run_overlay(
             size: Some((0, 0)),
             anchor: Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right,
             layer: Layer::Overlay,
-            exclusive_zone: 0,
+            // -1 = ignore panel exclusive zones so the surface spans the full
+            // output. With 0 the surface shrinks around panels and its origin
+            // no longer matches the screen origin — anchored bubbles would be
+            // offset by the panel height on top/left panel setups.
+            exclusive_zone: -1,
             keyboard_interactivity: KeyboardInteractivity::None,
             start_mode,
             events_transparent: false,
@@ -817,10 +869,16 @@ fn update(app: &mut TeachOverlayApp, message: Message) -> Task<Message> {
             }
             app.last_tick = Some(now);
 
-            if app.shutdown.load(Ordering::Relaxed)
-                && let Some(window_id) = app.window_id
-            {
-                tasks.push(window::close(window_id));
+            if app.shutdown.load(Ordering::Relaxed) {
+                // Closing the last window is not enough: iced_layershell only
+                // drops the compositor and keeps its event loop running, so
+                // `run()` would never return and the runner thread would leak
+                // (leaving a ghost overlay behind on display switches).
+                // Request a runtime exit so the thread actually finishes.
+                if let Some(window_id) = app.window_id {
+                    tasks.push(window::close(window_id));
+                }
+                tasks.push(iced::exit());
             }
 
             Task::batch(tasks)
