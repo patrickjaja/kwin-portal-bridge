@@ -33,26 +33,13 @@ use tokio::signal::unix::{SignalKind, signal};
 pub enum SessionRequest {
     SessionInfo,
     Shutdown,
-    MovePointerAbsolute {
-        stream: Option<u32>,
-        x: f64,
-        y: f64,
-    },
     MovePointerScreenPoint {
         screen: ScreenInfo,
         x: i32,
         y: i32,
     },
-    PointerButton {
-        button: i32,
-        pressed: bool,
-    },
     LeftMouseDown,
     LeftMouseUp,
-    KeyboardKeycode {
-        keycode: i32,
-        pressed: bool,
-    },
     TypeText {
         text: String,
         delay_ms: u64,
@@ -387,20 +374,11 @@ async fn handle_request(
                 true,
             );
         }
-        SessionRequest::MovePointerAbsolute { stream, x, y } => {
-            respond_async(session.move_pointer_absolute(stream, x, y).await)
-        }
         SessionRequest::MovePointerScreenPoint { screen, x, y } => {
             respond_async(session.move_pointer_screen_point(&screen, x, y).await)
         }
-        SessionRequest::PointerButton { button, pressed } => {
-            respond_async(session.pointer_button(button, pressed).await)
-        }
         SessionRequest::LeftMouseDown => respond_async(session.left_mouse_down().await),
         SessionRequest::LeftMouseUp => respond_async(session.left_mouse_up().await),
-        SessionRequest::KeyboardKeycode { keycode, pressed } => {
-            respond_async(session.keyboard_keycode(keycode, pressed).await)
-        }
         SessionRequest::TypeText { text, delay_ms } => {
             respond_async(session.type_text(&text, delay_ms).await)
         }

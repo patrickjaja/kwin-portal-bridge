@@ -1,5 +1,4 @@
 use std::io::Write;
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,8 +10,7 @@ use dbus::message::MatchRule;
 use serde::de::DeserializeOwned;
 
 use crate::model::{
-    CursorPosition, DoctorReport, ExcludeUpdate, Rect, ScreenInfo, ToolPresence,
-    WindowControlResult, WindowInfo,
+    CursorPosition, ExcludeUpdate, Rect, ScreenInfo, WindowControlResult, WindowInfo,
 };
 use crate::util;
 
@@ -27,15 +25,6 @@ pub struct KWinBackend;
 impl KWinBackend {
     pub fn new() -> Self {
         Self
-    }
-
-    pub fn doctor(&self) -> Result<DoctorReport> {
-        let tools = ["qdbus6", "gdbus", "kwin_wayland", "xdg-desktop-portal"]
-            .into_iter()
-            .map(command_presence)
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(DoctorReport { tools })
     }
 
     pub fn list_screens(&self) -> Result<Vec<ScreenInfo>> {
@@ -138,26 +127,6 @@ impl KWinBackend {
 
 fn parse_payload<T: DeserializeOwned>(payload: String) -> Result<T> {
     serde_json::from_str(&payload).context("failed to decode KWin JSON payload")
-}
-
-fn command_presence(command: &str) -> Result<ToolPresence> {
-    let output = Command::new("which")
-        .arg(command)
-        .output()
-        .with_context(|| format!("failed to probe `{command}` with `which`"))?;
-
-    let available = output.status.success();
-    let path = if available {
-        Some(String::from_utf8(output.stdout)?.trim().to_owned())
-    } else {
-        None
-    };
-
-    Ok(ToolPresence {
-        command: command.to_owned(),
-        available,
-        path,
-    })
 }
 
 fn run_json_script(script_name: &str, script_body: &str) -> Result<String> {

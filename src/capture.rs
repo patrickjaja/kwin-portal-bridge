@@ -1,8 +1,7 @@
 use std::io::Cursor;
-use std::path::Path;
 
 use crate::kwin::KWinBackend;
-use crate::model::{SavedImageResult, ScreenInfo, ScreenshotCapture, ScreenshotResult};
+use crate::model::{ScreenInfo, ScreenshotCapture, ScreenshotResult};
 use crate::portal::PortalBackend;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -52,34 +51,6 @@ impl CaptureBackend {
         let screens = kwin.list_screens()?;
         let screen = resolve_screen(&screens, display)?;
         portal.capture_zoom_image(screen, x, y, w, h).await
-    }
-
-    pub async fn save_png(
-        &self,
-        portal: &PortalBackend,
-        stream: Option<u32>,
-        output: &str,
-    ) -> Result<SavedImageResult> {
-        let captured = portal.capture_raw_frame(stream).await?;
-        let rgba = rgba_from_frame(&captured.frame)?;
-        let image = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(
-            captured.frame.width,
-            captured.frame.height,
-            rgba,
-        )
-        .ok_or_else(|| anyhow::anyhow!("failed to construct RGBA image buffer"))?;
-
-        image
-            .save(Path::new(output))
-            .with_context(|| format!("failed to save PNG to `{output}`"))?;
-
-        Ok(SavedImageResult {
-            path: output.to_owned(),
-            width: captured.frame.width,
-            height: captured.frame.height,
-            format: format!("{:?}", captured.frame.format),
-            bytes: captured.frame_byte_len,
-        })
     }
 }
 

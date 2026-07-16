@@ -3,14 +3,13 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 
-use crate::capture::{CaptureBackend, resolve_screen};
+use crate::capture::resolve_screen;
 use crate::desktop_apps::{AliasIndex, DesktopAppService};
 use crate::exclude_state::ExcludeStateStore;
 use crate::kwin::KWinBackend;
 use crate::model::{
     AppRef, DragActionResult, KeyboardActionResult, PointerActionResult, PrepareActionResult,
-    RaiseWindowAtPointResult, ResolvePrepareCaptureResult, ScreenInfo, ScreenshotResult,
-    TypeActionResult, WindowInfo,
+    ScreenInfo, TypeActionResult, WindowInfo,
 };
 use crate::portal::{PortalBackend, point_in_screen};
 use crate::util;
@@ -60,132 +59,6 @@ impl ExecutorBackend {
         let windows = kwin.list_windows()?;
         Ok(top_window_at_point_ignoring_bridge(&windows, x, y)
             .map(|window| app_ref_for_window(window, &idx)))
-    }
-
-    pub fn raise_allowed_window_at_point(
-        &self,
-        allowed_bundle_ids: &[String],
-        host_bundle_id: &str,
-        x: i32,
-        y: i32,
-        kwin: &KWinBackend,
-    ) -> Result<RaiseWindowAtPointResult> {
-        let idx = self.alias_index()?;
-        self.raise_allowed_window_at_point_inner(
-            allowed_bundle_ids,
-            host_bundle_id,
-            x,
-            y,
-            kwin,
-            &idx,
-        )
-    }
-
-    fn raise_allowed_window_at_point_inner(
-        &self,
-        allowed_bundle_ids: &[String],
-        host_bundle_id: &str,
-        x: i32,
-        y: i32,
-        kwin: &KWinBackend,
-        idx: &AliasIndex,
-    ) -> Result<RaiseWindowAtPointResult> {
-        let windows = kwin.list_windows()?;
-        let Some(topmost_window) = top_window_at_point(&windows, x, y) else {
-            return Ok(RaiseWindowAtPointResult {
-                topmost: None,
-                raised: None,
-                blocked_by: None,
-            });
-        };
-
-        let topmost = app_ref_for_window(topmost_window, idx);
-        if is_shell_window(topmost_window)
-            || is_window_allowed(topmost_window, allowed_bundle_ids, host_bundle_id, idx)
-        {
-            return Ok(RaiseWindowAtPointResult {
-                topmost: Some(topmost),
-                raised: None,
-                blocked_by: None,
-            });
-        }
-
-        let target = windows_at_point_in_z_order(&windows, x, y)
-            .into_iter()
-            .rev()
-            .skip(1)
-            .find(|window| {
-                !is_shell_window(window)
-                    && is_window_allowed(window, allowed_bundle_ids, host_bundle_id, idx)
-            });
-
-        let Some(target) = target else {
-            return Ok(RaiseWindowAtPointResult {
-                topmost: Some(topmost.clone()),
-                raised: None,
-                blocked_by: Some(topmost),
-            });
-        };
-
-        kwin.activate_window(&target.id)?;
-
-        Ok(RaiseWindowAtPointResult {
-            topmost: Some(topmost),
-            raised: Some(app_ref_for_window(target, idx)),
-            blocked_by: None,
-        })
-    }
-
-    pub async fn click(
-        &self,
-        allowed_bundle_ids: &[String],
-        host_bundle_id: &str,
-        x: i32,
-        y: i32,
-        button: &str,
-        count: u32,
-        modifiers: &[String],
-        portal: &PortalBackend,
-        kwin: &KWinBackend,
-    ) -> Result<PointerActionResult> {
-        let screens = kwin.list_screens()?;
-        let screen = screen_at_point(&screens, x, y)?;
-        let raise =
-            self.raise_allowed_window_at_point(allowed_bundle_ids, host_bundle_id, x, y, kwin)?;
-
-        if let Some(blocked_by) = raise.blocked_by {
-            return Ok(PointerActionResult {
-                action: "click-blocked".to_owned(),
-                x,
-                y,
-                raised: raise.raised,
-                blocked_by: Some(blocked_by),
-            });
-        }
-
-        let keycodes = modifiers
-            .iter()
-            .map(|name| key_name_to_key_code(name))
-            .collect::<Result<Vec<_>>>()?;
-
-        portal
-            .click_screen_point(
-                screen,
-                x,
-                y,
-                button_name_to_evdev(button)?,
-                count,
-                &keycodes,
-            )
-            .await?;
-
-        Ok(PointerActionResult {
-            action: "click".to_owned(),
-            x,
-            y,
-            raised: raise.raised,
-            blocked_by: None,
-        })
     }
 
     pub async fn move_pointer(
@@ -241,43 +114,6 @@ impl ExecutorBackend {
             x,
             y,
             raised: None,
-            blocked_by: None,
-        })
-    }
-
-    pub async fn scroll(
-        &self,
-        allowed_bundle_ids: &[String],
-        host_bundle_id: &str,
-        x: i32,
-        y: i32,
-        dx: f64,
-        dy: f64,
-        portal: &PortalBackend,
-        kwin: &KWinBackend,
-    ) -> Result<PointerActionResult> {
-        let screens = kwin.list_screens()?;
-        let screen = screen_at_point(&screens, x, y)?;
-        let raise =
-            self.raise_allowed_window_at_point(allowed_bundle_ids, host_bundle_id, x, y, kwin)?;
-
-        if let Some(blocked_by) = raise.blocked_by {
-            return Ok(PointerActionResult {
-                action: "scroll-blocked".to_owned(),
-                x,
-                y,
-                raised: raise.raised,
-                blocked_by: Some(blocked_by),
-            });
-        }
-
-        portal.scroll_screen_point(screen, x, y, dx, dy).await?;
-
-        Ok(PointerActionResult {
-            action: "scroll".to_owned(),
-            x,
-            y,
-            raised: raise.raised,
             blocked_by: None,
         })
     }
@@ -359,55 +195,6 @@ impl ExecutorBackend {
         portal: &PortalBackend,
     ) -> Result<TypeActionResult> {
         portal.type_text(text, delay_ms).await
-    }
-
-    pub async fn drag(
-        &self,
-        allowed_bundle_ids: &[String],
-        host_bundle_id: &str,
-        from_x: i32,
-        from_y: i32,
-        to_x: i32,
-        to_y: i32,
-        portal: &PortalBackend,
-        kwin: &KWinBackend,
-    ) -> Result<DragActionResult> {
-        let screens = kwin.list_screens()?;
-        let from_screen = screen_at_point(&screens, from_x, from_y)?;
-        let to_screen = screen_at_point(&screens, to_x, to_y)?;
-        let raise = self.raise_allowed_window_at_point(
-            allowed_bundle_ids,
-            host_bundle_id,
-            from_x,
-            from_y,
-            kwin,
-        )?;
-
-        if let Some(blocked_by) = raise.blocked_by {
-            return Ok(DragActionResult {
-                action: "drag-blocked".to_owned(),
-                from_x,
-                from_y,
-                to_x,
-                to_y,
-                raised: raise.raised,
-                blocked_by: Some(blocked_by),
-            });
-        }
-
-        portal
-            .drag_screen_points(from_screen, from_x, from_y, to_screen, to_x, to_y)
-            .await?;
-
-        Ok(DragActionResult {
-            action: "drag".to_owned(),
-            from_x,
-            from_y,
-            to_x,
-            to_y,
-            raised: raise.raised,
-            blocked_by: None,
-        })
     }
 
     pub async fn drag_raw(
@@ -506,56 +293,6 @@ impl ExecutorBackend {
             activated: None,
         })
     }
-
-    pub async fn resolve_prepare_capture(
-        &self,
-        allowed_bundle_ids: &[String],
-        host_bundle_id: &str,
-        display: Option<&str>,
-        do_hide: bool,
-        capture: &CaptureBackend,
-        portal: &PortalBackend,
-        kwin: &KWinBackend,
-    ) -> Result<ResolvePrepareCaptureResult> {
-        let idx = self.alias_index()?;
-        let screens = kwin.list_screens()?;
-        let windows = kwin.list_windows()?;
-        let screen = resolve_capture_screen(&screens, &windows, display, host_bundle_id, &idx)?;
-
-        let (hidden, activated, changed_window_ids) = if do_hide {
-            let candidates = select_hide_candidates(
-                &windows,
-                Some(screen),
-                allowed_bundle_ids,
-                host_bundle_id,
-                &idx,
-            );
-            let hidden = hidden_bundle_ids(&candidates, &idx);
-            let activated = active_bundle_id(&windows, &idx);
-            let changed_window_ids = windows_to_change(&candidates, true);
-
-            if !changed_window_ids.is_empty() {
-                kwin.set_exclude_from_capture(&changed_window_ids, true)?;
-            }
-
-            (hidden, activated, changed_window_ids)
-        } else {
-            (Vec::new(), None, Vec::new())
-        };
-
-        let capture_result = capture
-            .capture_still_frame(Some(&screen.id), portal, kwin)
-            .await;
-
-        if !changed_window_ids.is_empty() {
-            kwin.set_exclude_from_capture(&changed_window_ids, false)?;
-        }
-
-        match capture_result {
-            Ok(screenshot) => Ok(resolve_capture_success(screenshot, hidden, activated)),
-            Err(error) => Ok(resolve_capture_error(screen, hidden, activated, error)),
-        }
-    }
 }
 
 fn resolve_optional_screen<'a>(
@@ -568,86 +305,11 @@ fn resolve_optional_screen<'a>(
     }
 }
 
-fn resolve_capture_screen<'a>(
-    screens: &'a [ScreenInfo],
-    windows: &[WindowInfo],
-    selector: Option<&str>,
-    host_bundle_id: &str,
-    idx: &AliasIndex,
-) -> Result<&'a ScreenInfo> {
-    match selector {
-        Some(_) => resolve_screen(screens, selector),
-        None => auto_capture_screen(screens, windows, host_bundle_id, idx),
-    }
-}
-
-fn auto_capture_screen<'a>(
-    screens: &'a [ScreenInfo],
-    windows: &[WindowInfo],
-    host_bundle_id: &str,
-    idx: &AliasIndex,
-) -> Result<&'a ScreenInfo> {
-    if screens.is_empty() {
-        bail!("no screens reported by KWin");
-    }
-
-    if let Some(screen) = screen_for_host_window(screens, windows, host_bundle_id, idx) {
-        return Ok(screen);
-    }
-
-    screens
-        .iter()
-        .find(|screen| screen.is_primary)
-        .or_else(|| screens.first())
-        .ok_or_else(|| anyhow::anyhow!("no screen available"))
-}
-
 fn screen_at_point(screens: &[ScreenInfo], x: i32, y: i32) -> Result<&ScreenInfo> {
     screens
         .iter()
         .find(|screen| point_in_screen(screen, x, y))
         .ok_or_else(|| anyhow::anyhow!("point {x},{y} is not inside any known display"))
-}
-
-fn resolve_capture_success(
-    screenshot: ScreenshotResult,
-    hidden: Vec<String>,
-    activated: Option<String>,
-) -> ResolvePrepareCaptureResult {
-    ResolvePrepareCaptureResult {
-        base64: screenshot.base64,
-        width: screenshot.width,
-        height: screenshot.height,
-        display_width: screenshot.display_width,
-        display_height: screenshot.display_height,
-        display_id: screenshot.display_id,
-        origin_x: screenshot.origin_x,
-        origin_y: screenshot.origin_y,
-        hidden,
-        activated,
-        capture_error: None,
-    }
-}
-
-fn resolve_capture_error(
-    screen: &ScreenInfo,
-    hidden: Vec<String>,
-    activated: Option<String>,
-    error: anyhow::Error,
-) -> ResolvePrepareCaptureResult {
-    ResolvePrepareCaptureResult {
-        base64: String::new(),
-        width: 0,
-        height: 0,
-        display_width: screen.geometry.width.max(0) as u32,
-        display_height: screen.geometry.height.max(0) as u32,
-        display_id: screen.id.clone(),
-        origin_x: screen.geometry.x,
-        origin_y: screen.geometry.y,
-        hidden,
-        activated,
-        capture_error: Some(format!("{error:#}")),
-    }
 }
 
 fn select_hide_candidates<'a>(
@@ -865,10 +527,6 @@ fn key_name_to_key_code(name: &str) -> Result<i32> {
     Ok(code)
 }
 
-fn active_bundle_id(windows: &[WindowInfo], idx: &AliasIndex) -> Option<String> {
-    frontmost_window_ignoring_bridge(windows).and_then(|window| bundle_id_for_window(window, idx))
-}
-
 fn frontmost_window_ignoring_bridge(windows: &[WindowInfo]) -> Option<&WindowInfo> {
     windows
         .iter()
@@ -880,26 +538,6 @@ fn frontmost_window_ignoring_bridge(windows: &[WindowInfo]) -> Option<&WindowInf
                 window.stacking_order,
             )
         })
-}
-
-fn screen_for_host_window<'a>(
-    screens: &'a [ScreenInfo],
-    windows: &[WindowInfo],
-    host_bundle_id: &str,
-    idx: &AliasIndex,
-) -> Option<&'a ScreenInfo> {
-    windows
-        .iter()
-        .filter(|window| is_host_window(window, host_bundle_id, idx))
-        .filter(|window| !is_shell_window(window))
-        .filter(|window| is_window_visible_for_hit_test(window))
-        .max_by_key(|window| {
-            (
-                if window.is_active { 1_u8 } else { 0_u8 },
-                window.stacking_order,
-            )
-        })
-        .and_then(|window| screen_for_window(screens, window))
 }
 
 fn bundle_id_for_window(window: &WindowInfo, idx: &AliasIndex) -> Option<String> {
@@ -958,12 +596,6 @@ fn is_window_allowed(
     bundle_id == host_bundle_id || allowed_bundle_ids.iter().any(|id| id == &bundle_id)
 }
 
-fn top_window_at_point(windows: &[WindowInfo], x: i32, y: i32) -> Option<&WindowInfo> {
-    windows_at_point_in_z_order(windows, x, y)
-        .into_iter()
-        .next_back()
-}
-
 fn top_window_at_point_ignoring_bridge(
     windows: &[WindowInfo],
     x: i32,
@@ -992,34 +624,6 @@ fn is_window_visible_for_hit_test(window: &WindowInfo) -> bool {
     }
 
     window.is_visible.unwrap_or(true)
-}
-
-fn screen_for_window<'a>(screens: &'a [ScreenInfo], window: &WindowInfo) -> Option<&'a ScreenInfo> {
-    if let Some(output) = &window.output
-        && let Some(screen) = screens
-            .iter()
-            .find(|screen| screen.id == *output || screen.name == *output)
-    {
-        return Some(screen);
-    }
-
-    screens
-        .iter()
-        .filter_map(|screen| {
-            let overlap = rect_intersection_area(
-                window.geometry.x,
-                window.geometry.y,
-                window.geometry.width,
-                window.geometry.height,
-                screen.geometry.x,
-                screen.geometry.y,
-                screen.geometry.width,
-                screen.geometry.height,
-            );
-            (overlap > 0).then_some((screen, overlap))
-        })
-        .max_by_key(|(_, overlap)| *overlap)
-        .map(|(screen, _)| screen)
 }
 
 fn window_matches_screen(window: &WindowInfo, screen: Option<&ScreenInfo>) -> bool {
@@ -1052,32 +656,6 @@ fn rect_contains_point(rect: &crate::model::Rect, x: i32, y: i32) -> bool {
         && x < rect.x.saturating_add(rect.width)
         && y >= rect.y
         && y < rect.y.saturating_add(rect.height)
-}
-
-fn rect_intersection_area(
-    ax: i32,
-    ay: i32,
-    aw: i32,
-    ah: i32,
-    bx: i32,
-    by: i32,
-    bw: i32,
-    bh: i32,
-) -> i64 {
-    if aw <= 0 || ah <= 0 || bw <= 0 || bh <= 0 {
-        return 0;
-    }
-
-    let left = ax.max(bx);
-    let top = ay.max(by);
-    let right = ax.saturating_add(aw).min(bx.saturating_add(bw));
-    let bottom = ay.saturating_add(ah).min(by.saturating_add(bh));
-
-    if right <= left || bottom <= top {
-        return 0;
-    }
-
-    i64::from(right - left) * i64::from(bottom - top)
 }
 
 #[cfg(test)]
