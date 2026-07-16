@@ -939,11 +939,14 @@ fn match_stream_to_screen(
     let physical_w = ((logical_w as f64) * scale).round() as i32;
     let physical_h = ((logical_h as f64) * scale).round() as i32;
 
+    // Both dimensions must match in the same coordinate space; mixing a
+    // logical width with a physical height (possible under fractional
+    // scaling) would accept the wrong stream and skew pointer coordinates.
     let exact = streams.iter().find(|stream| {
         stream.position[0] == screen.geometry.x
             && stream.position[1] == screen.geometry.y
-            && (stream.size[0] == logical_w || stream.size[0] == physical_w)
-            && (stream.size[1] == logical_h || stream.size[1] == physical_h)
+            && ((stream.size[0] == logical_w && stream.size[1] == logical_h)
+                || (stream.size[0] == physical_w && stream.size[1] == physical_h))
     });
 
     let fallback = streams.iter().find(|stream| {

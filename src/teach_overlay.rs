@@ -128,13 +128,23 @@ impl TeachOverlayProcess {
             });
         }
 
-        let child = command
+        let mut child = command
             .spawn()
             .context("failed to spawn teach overlay controller")?;
 
         let deadline = Instant::now() + Duration::from_secs(3);
         while !socket.exists() {
+            if let Ok(Some(status)) = child.try_wait() {
+                bail!(
+                    "teach overlay controller exited during startup ({status}); see `{}`",
+                    log_path()?.display()
+                );
+            }
             if Instant::now() >= deadline {
+                // Don't leave the still-running child behind as a zombie the
+                // long-lived daemon will never reap.
+                child.kill().ok();
+                child.wait().ok();
                 bail!("teach overlay controller did not create its socket in time");
             }
             thread::sleep(Duration::from_millis(50));
@@ -477,7 +487,10 @@ impl TeachOverlayService {
                 .shared
                 .lock()
                 .expect("teach overlay state mutex poisoned");
-            resolve_pending_locked(&mut state, "exit");
+            // A superseded step is not a user abort — keep "exit" reserved for
+            // the user actually leaving so overlapping controllers can tell
+            // the difference.
+            resolve_pending_locked(&mut state, "superseded");
             state.mode = TeachVisualMode::Step;
             state.last_payload = Some(payload);
             rebuild_resolved_payload(&mut state);
@@ -554,9 +567,17 @@ impl TeachOverlayService {
     }
 
     fn ensure_runner(&mut self) -> Result<()> {
-        if self.runner.is_some() {
+        // A runner whose thread already exited (e.g. Wayland/layer-shell init
+        // failure) must not count as running, or every later show-step blocks
+        // forever on a pending step no UI will ever resolve.
+        if self
+            .runner
+            .as_ref()
+            .is_some_and(|runner| !runner.join_handle.is_finished())
+        {
             return Ok(());
         }
+        self.stop_runner();
 
         let display = self
             .shared
@@ -672,6 +693,19 @@ impl TeachOverlayRunner {
 
     fn stop(self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        // The UI thread only exits after closing its window; if the surface
+        // never mapped (e.g. a nonexistent output name) it would never
+        // terminate, and callers hold the service mutex while stopping — an
+        // unbounded join here bricks the whole teach socket. Wait a bounded
+        // time, then detach as a last resort.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !self.join_handle.is_finished() {
+            if Instant::now() >= deadline {
+                eprintln!("[teach-overlay] runner did not shut down in time; detaching its thread");
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
         self.join_handle.join().ok();
     }
 }

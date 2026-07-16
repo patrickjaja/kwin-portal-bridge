@@ -58,7 +58,12 @@ impl KWinBackend {
             bail!("at least one --window must be provided");
         }
 
-        let args_json = serde_json::to_string(windows)?;
+        // serde_json leaves U+2028/U+2029 unescaped, which are invalid inside
+        // string literals for older JS engines — escape them so a hostile or
+        // odd window id can't turn the generated script into a syntax error.
+        let args_json = serde_json::to_string(windows)?
+            .replace('\u{2028}', "\\u2028")
+            .replace('\u{2029}', "\\u2029");
         // SCRIPT_HEADER is prepended by render_script (along with the bridge
         // constants), so the body only carries its own inputs and logic.
         let script = format!(
@@ -68,11 +73,20 @@ impl KWinBackend {
         let payload = run_json_script("kwin-portal-bridge-exclude", &script)?;
         let updated: ExcludeUpdate = parse_payload(payload)?;
 
-        if updated.windows.len() != windows.len() {
+        // Compare id sets, not counts: duplicate --window arguments and the
+        // per-window result list would otherwise report failure after the
+        // mutation already succeeded.
+        let updated_ids: std::collections::HashSet<&str> =
+            updated.windows.iter().map(String::as_str).collect();
+        let missing: Vec<&str> = windows
+            .iter()
+            .map(String::as_str)
+            .filter(|id| !updated_ids.contains(id))
+            .collect();
+        if !missing.is_empty() {
             bail!(
-                "KWin updated {} window(s), but {} were requested",
-                updated.windows.len(),
-                windows.len()
+                "KWin did not match requested window(s): {}",
+                missing.join(", ")
             );
         }
 
@@ -191,7 +205,12 @@ fn run_script(
         .method_call(
             "org.kde.kwin.Scripting",
             "loadScript",
-            (script_path.to_str().unwrap(), unique_name),
+            (
+                script_path
+                    .to_str()
+                    .context("temporary KWin script path is not valid UTF-8")?,
+                unique_name,
+            ),
         )
         .context("failed to load the temporary KWin script")?;
 
@@ -256,11 +275,15 @@ fn messages_include_terminal_event(messages: &Arc<Mutex<Vec<(String, String)>>>)
         .any(|(kind, _)| matches!(kind.as_str(), "result" | "error")))
 }
 
-fn unique_suffix() -> u128 {
-    SystemTime::now()
+fn unique_suffix() -> String {
+    // Include the PID: concurrent invocations (e.g. parallel MCP tool calls)
+    // can land in the same microsecond, and KWin rejects duplicate plugin
+    // names with an opaque "refused to load script" error.
+    let micros = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_micros())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    format!("{}-{micros}", std::process::id())
 }
 
 fn render_script(dbus_addr: &str, script_body: &str) -> String {

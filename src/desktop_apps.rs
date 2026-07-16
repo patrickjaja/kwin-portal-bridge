@@ -55,8 +55,19 @@ impl DesktopAppService {
         let entry = index.resolve_entry(target)?;
 
         let launcher = if entry.entry.dbus_activatable() || entry.entry.exec().is_none() {
-            launch_via_kio(&entry.entry)?;
-            "kio-launch".to_owned()
+            if command_exists("kioclient") {
+                launch_via_kio(&entry.entry)?;
+                "kio-launch".to_owned()
+            } else if entry.entry.exec().is_some() {
+                // DBusActivatable entries normally go through kio, but a valid
+                // Exec= line beats failing outright on systems without
+                // kioclient (non-KDE sessions, minimal installs).
+                launch_via_exec(&entry.entry)
+                    .context("`kioclient` is unavailable, and desktop entry exec launch failed")?;
+                "desktop-entry-exec-fallback".to_owned()
+            } else {
+                bail!("`kioclient` is not available and the desktop entry has no Exec line");
+            }
         } else {
             match launch_via_exec(&entry.entry) {
                 Ok(()) => "desktop-entry-exec".to_owned(),
@@ -443,18 +454,21 @@ fn launch_via_kio(entry: &DesktopEntry) -> Result<()> {
 
 fn launch_via_exec(entry: &DesktopEntry) -> Result<()> {
     let expanded = expand_exec(entry)?;
-    let mut command = Command::new(&expanded.program);
-    command.args(&expanded.args);
-
-    if let Some(cwd) = expanded.cwd {
-        command.current_dir(cwd);
-    }
 
     if expanded.terminal {
         let (program, args) = wrap_in_terminal(expanded.program, expanded.args);
         let mut terminal_command = Command::new(program);
         terminal_command.args(args);
+        if let Some(cwd) = expanded.cwd {
+            terminal_command.current_dir(cwd);
+        }
         return spawn_detached(&mut terminal_command);
+    }
+
+    let mut command = Command::new(&expanded.program);
+    command.args(&expanded.args);
+    if let Some(cwd) = expanded.cwd {
+        command.current_dir(cwd);
     }
 
     spawn_detached(&mut command)
@@ -653,17 +667,31 @@ fn spawn_detached(command: &mut Command) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    // Double-fork so the launched app is reparented to init instead of staying
+    // our direct child: the long-lived MCP server never reaps children, so a
+    // plain setsid+spawn accumulates one zombie per exited app. The
+    // intermediate child exits immediately and is reaped by the wait() below.
+    // SAFETY: the pre_exec closure runs post-fork/pre-exec, so it may only
+    // call async-signal-safe functions — setsid, fork, and _exit qualify, and
+    // the closure allocates nothing.
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
             }
-            Ok(())
+            match libc::fork() {
+                -1 => Err(std::io::Error::last_os_error()),
+                0 => Ok(()),
+                _ => libc::_exit(0),
+            }
         });
     }
-    command
+    let mut intermediate = command
         .spawn()
         .context("failed to spawn detached desktop entry command")?;
+    intermediate
+        .wait()
+        .context("failed to reap detach helper process")?;
     Ok(())
 }
 

@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -45,6 +46,19 @@ impl TokenStore {
             token: token.to_owned(),
         })?;
 
-        fs::write(&self.path, payload).context("failed to write restore token file")
+        // Write-then-rename keeps the token file atomic: a crash or a second
+        // concurrent session mid-write would otherwise leave truncated JSON,
+        // silently dropping the token and re-prompting for capture consent.
+        let dir = self
+            .path
+            .parent()
+            .context("restore token path has no parent directory")?;
+        let mut temp = tempfile::NamedTempFile::new_in(dir)
+            .context("failed to create restore token temp file")?;
+        temp.write_all(payload.as_bytes())
+            .context("failed to write restore token file")?;
+        temp.persist(&self.path)
+            .context("failed to persist restore token file")?;
+        Ok(())
     }
 }

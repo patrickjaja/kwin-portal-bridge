@@ -78,8 +78,12 @@ impl SessionOverlayProcess {
             return Ok(());
         }
 
-        self.shutdown();
+        // Spawn the replacement before killing the old overlay: the reverse
+        // order leaves `self` holding a dead child but the old `output` value
+        // when spawn fails, so a later retry with that value would no-op and
+        // the consent indicator would stay gone for the rest of the session.
         let replacement = Self::spawn(output)?;
+        self.shutdown();
         *self = replacement;
         Ok(())
     }

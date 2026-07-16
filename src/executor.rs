@@ -243,8 +243,12 @@ impl ExecutorBackend {
         let changed_window_ids = windows_to_change(&candidates, true);
 
         if !changed_window_ids.is_empty() {
-            kwin.set_exclude_from_capture(&changed_window_ids, true)?;
+            // Persist intent before mutating KWin: if the exclude call fails
+            // (or only partially applies), the restore path still knows about
+            // every window we may have hidden. The reverse order would strand
+            // hidden-but-untracked windows that no restore can recover.
             self.state.save(&changed_window_ids)?;
+            kwin.set_exclude_from_capture(&changed_window_ids, true)?;
         } else {
             self.state.clear()?;
         }
@@ -346,17 +350,20 @@ fn activate_visible_windows_in_z_order(
 
     visible_windows.sort_by_key(|window| window.stacking_order);
 
-    let mut seen_allowed = false;
+    // Walk top-to-bottom: activation is needed exactly when a disallowed
+    // window sits above an allowed one. Disallowed windows are only excluded
+    // from *capture* — they stay physically on top, so a click aimed at the
+    // allowed app visible in the screenshot would land on the hidden window.
+    let mut seen_disallowed = false;
     let mut needs_activation = false;
     for window in visible_windows.iter().rev() {
         if is_window_allowed(window, allowed_bundle_ids, host_bundle_id, idx) {
-            seen_allowed = true;
-            continue;
-        }
-
-        if seen_allowed {
-            needs_activation = true;
-            break;
+            if seen_disallowed {
+                needs_activation = true;
+                break;
+            }
+        } else {
+            seen_disallowed = true;
         }
     }
 
