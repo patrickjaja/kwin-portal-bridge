@@ -21,7 +21,15 @@ use crate::model::{
 };
 use crate::token_store::TokenStore;
 
-const PORTAL_APP_ID: &str = "com.anthropic.Claude";
+const DEFAULT_PORTAL_APP_ID: &str = "com.anthropic.Claude";
+const PORTAL_APP_ID_ENV: &str = "KWIN_PORTAL_BRIDGE_APP_ID";
+
+fn portal_app_id() -> String {
+    std::env::var(PORTAL_APP_ID_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_PORTAL_APP_ID.to_string())
+}
 
 pub struct PortalBackend;
 pub struct LivePortalSession {
@@ -667,13 +675,14 @@ async fn try_start_session(
     restore_token: Option<String>,
     with_persistence: bool,
 ) -> Result<(PortalManager, PortalSessionHandle, Option<String>)> {
-    let app_id = AppID::try_from(PORTAL_APP_ID).context("invalid portal app id")?;
+    let portal_app_id = portal_app_id();
+    let app_id = AppID::try_from(portal_app_id.as_str()).context("invalid portal app id")?;
     if let Err(error) = register_host_app(app_id).await {
         let error_text = error.to_string();
         if error_text.contains("Connection already associated with an application ID") {
             eprintln!(
                 "[kwin-portal-bridge] portal connection already has an application ID for {}; continuing",
-                PORTAL_APP_ID
+                portal_app_id
             );
         } else {
             return Err(error).context("failed to register host app for portal session");

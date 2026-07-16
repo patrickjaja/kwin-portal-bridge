@@ -29,6 +29,7 @@ pub enum Command {
     Windows,
     /// Report the current global cursor position in logical coordinates.
     CursorPosition,
+    /// Move and resize a window through a KWin script.
     SetWindowGeometry {
         #[arg(long)]
         window: String,
@@ -41,12 +42,14 @@ pub enum Command {
         #[arg(long)]
         height: i32,
     },
+    /// Set or clear a window's keep-above flag through a KWin script.
     SetWindowKeepAbove {
         #[arg(long)]
         window: String,
         #[arg(long, action = clap::ArgAction::Set)]
         value: bool,
     },
+    /// Focus and raise a window through a KWin script.
     ActivateWindow {
         #[arg(long)]
         window: String,
@@ -184,35 +187,48 @@ pub enum Command {
         #[arg(long)]
         h: i32,
     },
+    /// Serve the session daemon on a Unix socket (internal; spawned by `session-start`).
+    #[command(hide = true)]
     ServeSession {
         #[arg(long)]
         socket: String,
     },
+    /// Run the layer-shell session indicator overlay (internal; spawned by the session daemon).
+    #[command(hide = true)]
     SessionOverlay {
         #[arg(long)]
         output: Option<String>,
     },
+    /// Move the session indicator overlay to a specific display.
     SetOverlayDisplay {
         #[arg(long)]
         display: Option<String>,
     },
+    /// Serve the teach overlay controller on a Unix socket (internal; spawned on demand).
+    #[command(hide = true)]
     ServeTeachOverlay {
         #[arg(long)]
         socket: String,
     },
+    /// Show a teach step from a JSON payload and wait for the user's response.
     TeachStep {
         #[arg(long)]
         payload: String,
         #[arg(long)]
         display: Option<String>,
     },
+    /// Switch the teach overlay to its working indicator.
     TeachWorking,
+    /// Hide the teach overlay.
     TeachHide,
+    /// Move the teach overlay to a specific display.
     TeachDisplay {
         #[arg(long)]
         display: String,
     },
+    /// Block until the teach overlay reports the next user event.
     TeachWaitEvent,
+    /// Render a teach overlay preview from a JSON payload without a running session.
     TeachOverlayPreview {
         #[arg(long)]
         payload: String,
