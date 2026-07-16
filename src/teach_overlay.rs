@@ -748,7 +748,11 @@ fn run_overlay(
             size: Some((0, 0)),
             anchor: Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right,
             layer: Layer::Overlay,
-            exclusive_zone: 0,
+            // -1 = ignore panel exclusive zones so the surface spans the full
+            // output. With 0 the surface shrinks around panels and its origin
+            // no longer matches the screen origin — anchored bubbles would be
+            // offset by the panel height on top/left panel setups.
+            exclusive_zone: -1,
             keyboard_interactivity: KeyboardInteractivity::None,
             start_mode,
             events_transparent: false,

@@ -104,7 +104,11 @@ pub fn run(output: Option<&str>) -> Result<()> {
                 size: Some((0, 0)),
                 anchor: Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right,
                 layer: Layer::Overlay,
-                exclusive_zone: 0,
+                // -1 = ignore other surfaces' exclusive zones: with 0 the
+                // compositor shrinks this surface to fit around panels, so
+                // the glow stops at the plasma bar instead of framing the
+                // whole screen.
+                exclusive_zone: -1,
                 keyboard_interactivity: KeyboardInteractivity::None,
                 start_mode,
                 events_transparent: true,
