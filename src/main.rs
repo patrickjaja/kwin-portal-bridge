@@ -274,7 +274,14 @@ async fn main() -> Result<()> {
         } => {
             let payload: TeachStepPayload =
                 serde_json::from_str(&payload).context("failed to decode teach preview payload")?;
-            preview_teach_overlay(payload, display, working, auto_exit_ms)?;
+            // Run the blocking iced app on a plain thread: on exit it drops
+            // its internal tokio runtime, which panics inside this
+            // #[tokio::main] context.
+            std::thread::spawn(move || {
+                preview_teach_overlay(payload, display, working, auto_exit_ms)
+            })
+            .join()
+            .map_err(|_| anyhow::anyhow!("teach overlay preview panicked"))??;
         }
     }
 

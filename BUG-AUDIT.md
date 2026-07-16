@@ -263,6 +263,50 @@ false-failure check means the safety mechanism can both fail to protect (inverte
 raise logic) and fail open (stuck-hidden windows). If only three things get fixed,
 make it #1, #2, and #7+#8 together.
 
+## Post-audit findings: teach-mode display targeting (2026-07-16)
+
+Reported symptom: first teach batch shows the bubble on the wrong screen; after
+retargeting, bubbles appear on both screens at once. Two distinct bugs:
+
+### 15. The teach overlay runner thread can never exit — `src/teach_overlay.rs` (Tick handler)
+
+`window::close` is not enough to stop the runner: iced_layershell 0.19 only
+drops the compositor when the last window closes and keeps its event loop
+running, so `run()` never returns. Every display switch (`restart_runner`)
+therefore had to kill a thread that cannot die — originally an unbounded
+`join()` (deadlocking the teach service, audit bug #5), and after the bounded
+join a detached-but-alive thread whose layer surface lingers as a ghost overlay
+on the old screen. Confirmed live via repeated
+`runner did not shut down in time; detaching its thread` in `teach-overlay.log`.
+
+✅ **FIXED** — the Tick handler now issues `iced::exit()` alongside the window
+close, which reaches the runtime's `Action::Exit` → `RequestExit` path so the
+thread terminates. Verified end-to-end: `teach-overlay-preview --auto-exit-ms
+3000` exits cleanly after 3 s (rc 0, previously never exited), and a live
+two-screen `teach-step` switch (DP-6 → DP-4) restarts the runner with no detach
+warning.
+
+### 16. Teach bubble targets the caller's guessed screen, not the anchor's — `src/teach_overlay.rs` (`show_step`)
+
+The desktop app resolves the teach display from `session.cuSelectedDisplayId`
+and falls back to *the Claude main window's screen* when unset — which is where
+first-batch bubbles ended up. The bridge trusted that guess even though the
+step payload carries `anchorLogical` in global coordinates.
+
+✅ **FIXED** — `show_step` now derives the display from the screen containing
+the anchor point (falling back to the caller-provided display when the step has
+no anchor or the anchor is offscreen). This also substantially resolves the
+open low-severity item about anchors being dropped when no display is
+configured: an anchored step now implies its display.
+
+### 17. `teach-overlay-preview` panicked on exit — `src/main.rs`
+
+With the runner actually exiting (#15), the preview crashed on shutdown:
+`Cannot drop a runtime in a context where blocking is not allowed` — the iced
+app's internal tokio runtime was dropped inside the CLI's `#[tokio::main]`
+context. ✅ **FIXED** — the preview now runs on a plain thread. The daemon's
+runner threads were never affected (fresh OS threads carry no tokio context).
+
 ## Remaining open items
 
 All fourteen high/medium findings are fixed. Still open from the low-severity

@@ -477,7 +477,11 @@ impl TeachOverlayService {
         payload: TeachStepPayload,
         display: Option<String>,
     ) -> Result<mpsc::Receiver<TeachOverlayAction>> {
-        if let Some(display) = display {
+        // The anchor names the thing this step points at, so the bubble must
+        // be on the screen containing it — callers only guess (the desktop
+        // app falls back to its own window's screen), and a bubble on the
+        // wrong screen also silently drops its anchor.
+        if let Some(display) = display_for_anchor(payload.anchor_logical.as_ref()).or(display) {
             self.set_display(display)?;
         }
 
@@ -655,6 +659,16 @@ fn resolve_payload(payload: &TeachStepPayload, display: Option<&str>) -> TeachSt
         next_preview: payload.next_preview.clone(),
         anchor_logical,
     }
+}
+
+fn display_for_anchor(anchor: Option<&TeachAnchorLogical>) -> Option<String> {
+    let anchor = anchor?;
+    let kwin = KWinBackend::new();
+    kwin.list_screens()
+        .ok()?
+        .into_iter()
+        .find(|screen| crate::portal::point_in_screen(screen, anchor.x, anchor.y))
+        .map(|screen| screen.id)
 }
 
 fn localize_anchor(anchor: &TeachAnchorLogical, display: &str) -> Option<TeachAnchorLogical> {
@@ -851,10 +865,16 @@ fn update(app: &mut TeachOverlayApp, message: Message) -> Task<Message> {
             }
             app.last_tick = Some(now);
 
-            if app.shutdown.load(Ordering::Relaxed)
-                && let Some(window_id) = app.window_id
-            {
-                tasks.push(window::close(window_id));
+            if app.shutdown.load(Ordering::Relaxed) {
+                // Closing the last window is not enough: iced_layershell only
+                // drops the compositor and keeps its event loop running, so
+                // `run()` would never return and the runner thread would leak
+                // (leaving a ghost overlay behind on display switches).
+                // Request a runtime exit so the thread actually finishes.
+                if let Some(window_id) = app.window_id {
+                    tasks.push(window::close(window_id));
+                }
+                tasks.push(iced::exit());
             }
 
             Task::batch(tasks)
