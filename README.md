@@ -45,9 +45,14 @@ Things to keep in mind before pointing it at anything important:
   disallowed apps are hidden from capture via a `prepare-for-action`
   transaction and restored immediately after, so partial failures
   don't leak other windows' contents.
-- **Long-lived portal session daemon.** One portal consent prompt per
-  tool-use lock instead of one per action. The session is held open by
-  a background daemon and torn down cleanly on exit.
+- **Long-lived portal session daemon.** One portal consent prompt the
+  first time ("Allow restoring on future sessions" stays on); the restore
+  token is stored under `$XDG_STATE_HOME/kwin-portal-bridge/` and every
+  later session starts without a prompt. The session is held open by a
+  background daemon and torn down cleanly on exit. Persistence is
+  requested through `RemoteDesktop.SelectDevices` only - the portal
+  refuses it on `ScreenCast.SelectSources` for a remote-desktop session,
+  which is why the token was never stored before.
 - **Clipboard integration** via `wl-clipboard-rs`, gated on the session
   lock.
 - **Desktop application integration**: enumerate installed `.desktop`
