@@ -302,16 +302,12 @@ fn request<T: DeserializeOwned>(request: TeachOverlayRequest) -> Result<T> {
 }
 
 pub fn socket_path() -> Result<PathBuf> {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let base = crate::util::runtime_base();
     Ok(base.join("kwin-portal-bridge").join("teach-overlay.sock"))
 }
 
 fn log_path() -> Result<PathBuf> {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let base = crate::util::runtime_base();
     let dir = base.join("kwin-portal-bridge");
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create teach log directory `{}`", dir.display()))?;

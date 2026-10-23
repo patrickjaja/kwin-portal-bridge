@@ -15,6 +15,7 @@ use wl_clipboard_rs::copy::{
 use wl_clipboard_rs::paste::{ClipboardType, MimeType as PasteMimeType, Seat, get_contents};
 
 use crate::capture::{screenshot_result_from_frame, zoom_result_from_frame};
+use crate::error_kind::{ErrorKind, kind_of, kinded};
 use crate::executor::ExecutorBackend;
 use crate::kwin::KWinBackend;
 use crate::model::{
@@ -279,6 +280,12 @@ struct SessionResponse {
     result: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// Machine-readable class of `error` (`ErrorKind::as_wire`), so the
+    /// client maps it to the contract exit code without parsing the text. A
+    /// string, not the enum: an older client ignores the field and a kind it
+    /// does not know reads as a generic failure instead of a decode error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error_kind: Option<String>,
 }
 
 /// What a daemon probe found.
@@ -428,6 +435,9 @@ fn check_still_starting(
 /// the socket, then make sure the process is actually gone. Bounded: a daemon
 /// that is stopped, wedged or behind its consent dialog is signalled instead
 /// of waited on, so an app quit can never hang here.
+///
+/// Contract v1 shape: `{"ok": true, "ended": <a daemon was there>, "daemon":
+/// "exited" | "sigterm" | "sigkill" | "shutdown-requested" | "none"}`.
 pub async fn stop_session_daemon() -> Result<Value> {
     let socket = socket_path()?;
     let daemon = live_daemon();
@@ -435,18 +445,63 @@ pub async fn stop_session_daemon() -> Result<Value> {
         request_daemon::<Value>(&socket, &SessionRequest::Shutdown, SHUTDOWN_REQUEST_TIMEOUT).await,
         DaemonReply::Reply(Ok(_))
     );
-    let mut ended = serde_json::json!({ "ended": true });
-    match daemon {
+    let how = match daemon {
         Some(daemon) => {
-            ended["daemon"] = Value::String(reap_daemon(&daemon, answered).await.to_owned());
+            let how = reap_daemon(&daemon, answered).await;
             // A daemon that had to be killed left its files behind.
             std::fs::remove_file(&socket).ok();
             remove_pidfile_if(daemon.pid);
+            how
         }
-        None if answered => ended["daemon"] = Value::String("shutdown-requested".to_owned()),
-        None => ended["daemon"] = Value::String("none".to_owned()),
+        None if answered => "shutdown-requested",
+        None => "none",
+    };
+    Ok(session_end_result(how))
+}
+
+fn session_end_result(how: &str) -> Value {
+    serde_json::json!({ "ok": true, "ended": how != "none", "daemon": how })
+}
+
+/// `forget-session`: end any running daemon through the normal session-end
+/// path, then delete the stored portal restore token (and nothing else).
+/// Without this, `session-end` + `session-start` silently replays the stored
+/// grant, so the consent dialog never shows again. Makes no D-Bus or portal
+/// calls and creates no directories, so it works with no KDE session running.
+pub async fn forget_session() -> Result<Value> {
+    let mut result = stop_session_daemon().await?;
+    let store = crate::token_store::TokenStore::locate()?;
+    result["token_removed"] = Value::Bool(store.remove()?);
+    result["token_path"] = Value::String(store.path().display().to_string());
+    Ok(result)
+}
+
+/// What `doctor` reports about the session daemon.
+pub struct DaemonProbe {
+    /// The daemon answered a ping within the budget.
+    pub answering: bool,
+    /// A daemon process exists (it may still be behind its consent dialog).
+    pub pid: Option<i32>,
+}
+
+/// Ping the daemon without starting anything and without creating files.
+/// The reply (session info, which carries the restore token) is dropped.
+pub async fn probe_daemon(limit: Duration) -> DaemonProbe {
+    let answering = match socket_path() {
+        Ok(socket) => matches!(
+            tokio::time::timeout(
+                limit,
+                request_daemon::<Value>(&socket, &SessionRequest::SessionInfo, limit),
+            )
+            .await,
+            Ok(DaemonReply::Reply(Ok(_)))
+        ),
+        Err(_) => false,
+    };
+    DaemonProbe {
+        answering,
+        pid: live_daemon().map(|daemon| daemon.pid),
     }
-    Ok(ended)
 }
 
 /// Make sure the daemon process is gone. Returns how it ended.
@@ -679,7 +734,10 @@ pub async fn open_session_daemon(
             return Err(error);
         }
     };
-    eprintln!("[kwin-portal-bridge] portal session ready");
+    eprintln!(
+        "[kwin-portal-bridge] portal session ready: {}",
+        session_summary(&session.info())
+    );
     let overlay = match SessionOverlayProcess::spawn(None) {
         Ok(overlay) => overlay,
         Err(error) => {
@@ -758,7 +816,7 @@ pub async fn serve_open_session(
                         stale_input_refusal(&request, deadline, MonoTime::now(), || peer_gone(&stream))
                     {
                         eprintln!("[kwin-portal-bridge] {reason}");
-                        let response = SessionResponse { ok: false, result: None, error: Some(reason) };
+                        let response = SessionResponse { ok: false, result: None, error: Some(reason), error_kind: None };
                         // The client is most likely gone; nothing to log if so.
                         let _ = tokio::time::timeout(IPC_IO_TIMEOUT, write_response(&mut stream, response)).await;
                         continue;
@@ -857,7 +915,8 @@ pub async fn request<T: DeserializeOwned>(request: SessionRequest) -> Result<T> 
     let timeout = request_timeout(&request);
     match request_daemon(&socket, &request, timeout).await {
         DaemonReply::Reply(result) => result,
-        DaemonReply::NotRunning => bail!("no active portal session"),
+        // The text stays: executors below contract 1 match on it.
+        DaemonReply::NotRunning => Err(kinded(ErrorKind::NoSession, "no active portal session")),
     }
 }
 
@@ -987,16 +1046,55 @@ async fn exchange<T: DeserializeOwned>(
     })?;
 
     if !response.ok {
-        bail!(
-            "{}",
-            response
-                .error
-                .unwrap_or_else(|| "session IPC request failed".to_owned())
+        let message = response
+            .error
+            .unwrap_or_else(|| "session IPC request failed".to_owned());
+        // The daemon's classification travels next to the text; re-attach it
+        // so `main` exits with the contract code for it.
+        return Err(
+            match response
+                .error_kind
+                .as_deref()
+                .and_then(ErrorKind::from_wire)
+            {
+                Some(kind) => kinded(kind, message),
+                None => anyhow::anyhow!(message),
+            },
         );
     }
 
     let value = response.result.unwrap_or(Value::Null);
     serde_json::from_value(value).context("failed to decode session IPC payload")
+}
+
+/// The session for the daemon log: id and shared streams, never the restore
+/// token (`session-start` no longer prints any of it).
+fn session_summary(info: &PortalSessionInfo) -> String {
+    let streams = info
+        .streams
+        .iter()
+        .map(|stream| {
+            format!(
+                "stream-{} at {},{} {}x{}",
+                stream.node_id,
+                stream.position[0],
+                stream.position[1],
+                stream.size[0],
+                stream.size[1]
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "session {} (restore token {}), shared: {}",
+        info.session_id,
+        if info.restore_token.is_some() {
+            "issued"
+        } else {
+            "not issued"
+        },
+        if streams.is_empty() { "none" } else { &streams }
+    )
 }
 
 /// "; see <daemon.log>" for transport-level daemon failures.
@@ -1023,10 +1121,7 @@ fn last_log_line(log: &str) -> Option<String> {
 }
 
 fn runtime_dir() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("kwin-portal-bridge")
+    crate::util::runtime_base().join("kwin-portal-bridge")
 }
 
 pub fn socket_path() -> Result<PathBuf> {
@@ -1101,6 +1196,7 @@ async fn handle_request(
                     ok: true,
                     result: Some(Value::Null),
                     error: None,
+                    error_kind: None,
                 },
                 true,
             );
@@ -1218,11 +1314,13 @@ fn respond_ok<T: Serialize>(value: T) -> SessionResponse {
             ok: true,
             result: Some(result),
             error: None,
+            error_kind: None,
         },
         Err(error) => SessionResponse {
             ok: false,
             result: None,
             error: Some(format!("failed to serialize session response: {error}")),
+            error_kind: None,
         },
     }
 }
@@ -1243,6 +1341,7 @@ fn respond_async<T: Serialize>(result: Result<T>) -> SessionResponse {
             ok: false,
             result: None,
             error: Some(format!("{error:#}")),
+            error_kind: kind_of(&error).map(|kind| kind.as_wire().to_owned()),
         },
     }
 }
@@ -1433,6 +1532,7 @@ mod tests {
                 ok: false,
                 result: None,
                 error: Some("stream 51 is not shared".to_owned()),
+                error_kind: None,
             },
         );
         let reply: DaemonReply<Value> = request_daemon(
@@ -1449,6 +1549,73 @@ mod tests {
         }
         server.await.unwrap();
         std::fs::remove_dir_all(socket.parent().unwrap()).ok();
+    }
+
+    async fn reply_kind(error_kind: Option<&str>) -> (Option<ErrorKind>, String) {
+        let socket = temp_socket("kind");
+        let server = answering_daemon(
+            &socket,
+            Duration::ZERO,
+            SessionResponse {
+                ok: false,
+                result: None,
+                error: Some("monitor DP-2 (0,0 1x1) is not shared".to_owned()),
+                error_kind: error_kind.map(ToOwned::to_owned),
+            },
+        );
+        let reply: DaemonReply<Value> = request_daemon(
+            &socket,
+            &SessionRequest::LeftMouseUp,
+            Duration::from_secs(2),
+        )
+        .await;
+        server.await.unwrap();
+        std::fs::remove_dir_all(socket.parent().unwrap()).ok();
+        match reply {
+            DaemonReply::Reply(Err(error)) => (kind_of(&error), format!("{error:#}")),
+            _ => panic!("expected the daemon's error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_error_kind_survives_the_socket() {
+        let (kind, text) = reply_kind(Some("not_shared")).await;
+        assert_eq!(kind, Some(ErrorKind::NotShared));
+        assert_eq!(text, "monitor DP-2 (0,0 1x1) is not shared");
+        // An older daemon (no kind) or a newer kind: generic failure, same text.
+        assert_eq!(reply_kind(None).await.0, None);
+        assert_eq!(reply_kind(Some("something_newer")).await.0, None);
+    }
+
+    #[test]
+    fn a_classified_daemon_error_is_sent_with_its_kind() {
+        let wrapped = Err::<(), _>(kinded(ErrorKind::NotShared, "monitor X is not shared"))
+            .context("click failed");
+        let response = respond_async(wrapped);
+        assert!(!response.ok);
+        assert_eq!(response.error_kind.as_deref(), Some("not_shared"));
+        assert_eq!(
+            response.error.as_deref(),
+            Some("click failed: monitor X is not shared")
+        );
+        let plain = respond_async(Err::<(), _>(anyhow::anyhow!("portal failed")));
+        assert_eq!(plain.error_kind, None);
+        // An older client reading a newer reply ignores the extra field.
+        let wire = serde_json::to_value(&response).unwrap();
+        assert_eq!(wire["error_kind"], "not_shared");
+    }
+
+    #[test]
+    fn session_end_reports_whether_a_daemon_was_there() {
+        assert_eq!(
+            session_end_result("none"),
+            serde_json::json!({ "ok": true, "ended": false, "daemon": "none" })
+        );
+        for how in ["exited", "sigterm", "sigkill", "shutdown-requested"] {
+            let result = session_end_result(how);
+            assert_eq!(result["ended"], true, "{how}");
+            assert_eq!(result["daemon"], how);
+        }
     }
 
     #[test]
@@ -1510,6 +1677,7 @@ mod tests {
                 ok: true,
                 result: Some(serde_json::to_value(session_info()).unwrap()),
                 error: None,
+                error_kind: None,
             },
         );
         let info = wait_until_ready(&socket, || true, Duration::from_secs(5))

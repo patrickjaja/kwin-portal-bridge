@@ -16,10 +16,7 @@ pub struct ExcludeStateStore {
 
 impl ExcludeStateStore {
     pub fn new() -> Result<Self> {
-        let home = std::env::var("HOME").context("HOME is not set")?;
-        let base = std::env::var("XDG_STATE_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(home).join(".local/state"));
+        let base = crate::util::state_base()?;
 
         let dir = base.join("kwin-portal-bridge");
         fs::create_dir_all(&dir).context("failed to create exclude-state directory")?;

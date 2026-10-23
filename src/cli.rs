@@ -21,8 +21,12 @@ pub enum Command {
         #[arg(long, default_value_t = false)]
         foreground: bool,
     },
+    /// Report the bridge, backend, session and grant state as JSON (CLI contract v1).
+    Doctor,
     /// End the long-lived portal session daemon for this tool-use lock.
     SessionEnd,
+    /// Forget the remembered screen-sharing choice so the next session shows the consent dialog again.
+    ForgetSession,
     /// Enumerate screens through a KWin script.
     Screens,
     /// Enumerate windows through a KWin script.
@@ -33,9 +37,9 @@ pub enum Command {
     SetWindowGeometry {
         #[arg(long)]
         window: String,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         x: i32,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         y: i32,
         #[arg(long)]
         width: i32,
@@ -79,25 +83,25 @@ pub enum Command {
     FrontmostApp,
     /// Report the topmost app at a global logical point.
     AppUnderPoint {
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         x: i32,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         y: i32,
     },
     /// Move the pointer to a global logical point.
     PointerMove {
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         x: i32,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         y: i32,
     },
     /// Click at a global logical point without executor-side allowlist checks.
     PointerClick {
         #[arg(long = "modifier")]
         modifiers: Vec<String>,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         x: i32,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         y: i32,
         #[arg(long, default_value = "left")]
         button: String,
@@ -106,24 +110,24 @@ pub enum Command {
     },
     /// Scroll at a global logical point without executor-side allowlist checks.
     PointerScroll {
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         x: i32,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         y: i32,
-        #[arg(long, default_value_t = 0.0)]
+        #[arg(long, allow_hyphen_values = true, default_value_t = 0.0)]
         dx: f64,
-        #[arg(long, default_value_t = 0.0)]
+        #[arg(long, allow_hyphen_values = true, default_value_t = 0.0)]
         dy: f64,
     },
     /// Drag between global logical points without executor-side allowlist checks.
     PointerDrag {
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         from_x: i32,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         from_y: i32,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         to_x: i32,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         to_y: i32,
     },
     /// Send an executor-style key sequence such as `ctrl+c`.
@@ -178,9 +182,9 @@ pub enum Command {
     Zoom {
         #[arg(long)]
         display: Option<String>,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         x: i32,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         y: i32,
         #[arg(long)]
         w: i32,
@@ -239,4 +243,110 @@ pub enum Command {
         #[arg(long)]
         auto_exit_ms: Option<u64>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Command {
+        let mut argv = vec!["kwin-portal-bridge"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv)
+            .unwrap_or_else(|error| panic!("{args:?} did not parse: {error}"))
+            .command
+    }
+
+    #[test]
+    fn pointer_flags_accept_negative_coordinates() {
+        assert!(matches!(
+            parse(&["pointer-move", "--x", "-5", "--y", "-1080"]),
+            Command::PointerMove { x: -5, y: -1080 }
+        ));
+        assert!(matches!(
+            parse(&["pointer-click", "--x", "-1", "--y", "-2"]),
+            Command::PointerClick { x: -1, y: -2, .. }
+        ));
+        assert!(matches!(
+            parse(&["app-under-point", "--x", "-3", "--y", "-4"]),
+            Command::AppUnderPoint { x: -3, y: -4 }
+        ));
+    }
+
+    #[test]
+    fn drag_endpoints_accept_negative_coordinates() {
+        assert!(matches!(
+            parse(&[
+                "pointer-drag",
+                "--from-x",
+                "-10",
+                "--from-y",
+                "-20",
+                "--to-x",
+                "-30",
+                "--to-y",
+                "-40",
+            ]),
+            Command::PointerDrag {
+                from_x: -10,
+                from_y: -20,
+                to_x: -30,
+                to_y: -40,
+            }
+        ));
+    }
+
+    #[test]
+    fn scroll_position_and_deltas_accept_negative_values() {
+        let Command::PointerScroll { x, y, dx, dy } = parse(&[
+            "pointer-scroll",
+            "--x",
+            "-5",
+            "--y",
+            "-6",
+            "--dx",
+            "-1.5",
+            "--dy",
+            "-3",
+        ]) else {
+            panic!("expected pointer-scroll");
+        };
+        assert_eq!((x, y), (-5, -6));
+        assert_eq!((dx, dy), (-1.5, -3.0));
+    }
+
+    #[test]
+    fn region_and_window_origins_accept_negative_values() {
+        assert!(matches!(
+            parse(&["zoom", "--x", "-7", "--y", "-8", "--w", "10", "--h", "10"]),
+            Command::Zoom { x: -7, y: -8, .. }
+        ));
+        assert!(matches!(
+            parse(&[
+                "set-window-geometry",
+                "--window",
+                "w",
+                "--x",
+                "-1920",
+                "--y",
+                "-1",
+                "--width",
+                "100",
+                "--height",
+                "100",
+            ]),
+            Command::SetWindowGeometry {
+                x: -1920,
+                y: -1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_non_numeric_hyphen_value_is_still_a_usage_error() {
+        let error = Cli::try_parse_from(["kwin-portal-bridge", "pointer-move", "--x", "--y", "5"])
+            .unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+    }
 }

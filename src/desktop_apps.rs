@@ -295,7 +295,7 @@ fn cow_into_owned(value: Cow<'_, str>) -> String {
     }
 }
 
-fn current_desktops() -> HashSet<String> {
+pub(crate) fn current_desktops() -> HashSet<String> {
     env::var("XDG_CURRENT_DESKTOP")
         .ok()
         .map(|value| {

@@ -59,6 +59,14 @@ Things to keep in mind before pointing it at anything important:
   requested through `RemoteDesktop.SelectDevices` only - the portal
   refuses it on `ScreenCast.SelectSources` for a remote-desktop session,
   which is why the token was never stored before.
+- **Forgetting the screen-sharing choice.** `kwin-portal-bridge
+  forget-session` ends any session daemon (same bounded reaping as
+  `session-end`) and deletes the stored restore token, so the next session
+  shows the consent dialog again; a plain `session-end` would replay the
+  same selection. It prints one JSON object (`ok`, `ended`, `daemon`,
+  `token_removed`, `token_path`), succeeds when nothing was there to remove,
+  leaves other state such as the exclude list alone, and needs no running
+  KDE session.
 - **Clipboard integration** via `wl-clipboard-rs`, gated on the session
   lock.
 - **Desktop application integration**: enumerate installed `.desktop`
@@ -101,6 +109,29 @@ kwin-portal-bridge mcp             # run as a standalone MCP server (PoC!)
 ```
 
 `kwin-portal-bridge --help` lists every subcommand.
+
+## CLI contract v1
+
+The bridge implements the
+[Computer Use bridge CLI contract v1](https://github.com/patrickjaja/claude-desktop-extra/blob/master/docs/computer-use-bridge-contract.md)
+that claude-desktop-extra uses for every bridge:
+
+- `doctor` reports `contract: 1`, the version, whether this is a KDE Plasma
+  Wayland session, whether KWin and the portal are on the session bus, the
+  restore-token and socket paths and whether the session daemon answers. It
+  exits 0 even with no session bus, and never opens a portal session.
+- `session-start` prints `{"ok":true,"session":"daemon"}` (the restore token
+  never reaches stdout), `session-end` prints `ok`, `ended` and `daemon`,
+  `forget-session` adds `token_removed` and `token_path`.
+- Errors go to stderr with nothing on stdout. Exit codes: 1 runtime error,
+  2 bad usage, 3 the target monitor is not shared in the portal session,
+  4 no live session (the daemon is gone). The daemon sends the error class
+  with its reply, so 3 and 4 hold for errors raised inside it.
+- Coordinate flags take negative values (`pointer-move --x -1920 --y 0`),
+  for monitors left of or above the origin.
+
+`cargo test` runs `tests/contract.rs` against the built binary in an
+isolated environment.
 
 ## License
 

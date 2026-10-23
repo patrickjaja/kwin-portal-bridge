@@ -2,6 +2,8 @@ mod capture;
 mod cli;
 mod daemon;
 mod desktop_apps;
+mod doctor;
+mod error_kind;
 mod exclude_state;
 mod executor;
 mod json;
@@ -23,8 +25,8 @@ use tracing_subscriber::EnvFilter;
 use crate::capture::CaptureBackend;
 use crate::cli::{Cli, Command};
 use crate::daemon::{
-    open_session_daemon, prepare_session_socket, serve_open_session, serve_session_daemon,
-    start_session_daemon, stop_session_daemon,
+    forget_session, open_session_daemon, prepare_session_socket, serve_open_session,
+    serve_session_daemon, start_session_daemon, stop_session_daemon,
 };
 use crate::desktop_apps::DesktopAppService;
 use crate::executor::ExecutorBackend;
@@ -41,13 +43,33 @@ use crate::teach_overlay::{
     set_working as set_teach_working, show_step as show_teach_step, wait_event as wait_teach_event,
 };
 
+/// `session-start` on success (contract v1). The session details, restore
+/// token included, never reach stdout; the daemon log has the summary.
+fn session_started() -> serde_json::Value {
+    serde_json::json!({ "ok": true, "session": "daemon" })
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .try_init();
 
+    // Bad usage exits 2 inside `parse`.
     let cli = Cli::parse();
+    if let Err(error) = run(cli).await {
+        // Same stderr text as anyhow's own `main` report; stdout stays empty.
+        // The exit code is the contract's: 3 = monitor not shared, 4 = no
+        // live session, else 1. The kind is typed even when it came back
+        // from the session daemon (`error_kind` on the socket).
+        eprintln!("Error: {error:?}");
+        std::process::exit(i32::from(error_kind::exit_code(error_kind::kind_of(
+            &error,
+        ))));
+    }
+}
+
+async fn run(cli: Cli) -> Result<()> {
     let kwin = KWinBackend::new;
     let capture = CaptureBackend::new;
     let desktop_apps = DesktopAppService::new;
@@ -64,16 +86,23 @@ async fn main() -> Result<()> {
                 let socket = prepare_session_socket().await?;
                 let (listener, session, overlay, teach_overlay) =
                     open_session_daemon(&socket).await?;
-                print_json(&session.info())?;
+                print_json(&session_started())?;
                 exit_after_serve(
                     serve_open_session(socket, listener, session, overlay, teach_overlay).await,
                 );
             } else {
-                print_json(&start_session_daemon().await?)?;
+                start_session_daemon().await?;
+                print_json(&session_started())?;
             }
+        }
+        Command::Doctor => {
+            print_json(&doctor::report().await)?;
         }
         Command::SessionEnd => {
             print_json(&stop_session_daemon().await?)?;
+        }
+        Command::ForgetSession => {
+            print_json(&forget_session().await?)?;
         }
         Command::Screens => {
             print_json(&kwin().list_screens()?)?;

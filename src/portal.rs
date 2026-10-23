@@ -15,6 +15,7 @@ use lamco_pipewire::{
 use lamco_portal::{PortalConfig, PortalManager, PortalSessionHandle};
 
 use crate::daemon::{SessionRequest, request};
+use crate::error_kind::{ErrorKind, kinded};
 use crate::model::{
     ButtonStateResult, CapturedFrame, ClipboardReadResult, ClipboardWriteResult,
     PortalActionResult, PortalSessionInfo, PortalStream, ScreenInfo, ScreenshotCapture,
@@ -1185,11 +1186,39 @@ fn match_stream_to_screen(
 
     let chosen = exact
         .or(fallback)
-        .ok_or_else(|| anyhow::anyhow!("no portal stream matched screen `{}`", screen.id))?;
+        .ok_or_else(|| not_shared_error(streams, screen))?;
 
     Ok(StreamSelection {
         stream: chosen.clone(),
     })
+}
+
+/// The contract's exit-3 error for a monitor with no stream in the portal
+/// session (the user did not share it in the consent dialog). The daemon only
+/// sees the target screen, so shared streams are named by their PipeWire node.
+fn not_shared_error(streams: &[PortalStream], screen: &ScreenInfo) -> anyhow::Error {
+    let shared = streams
+        .iter()
+        .map(|stream| {
+            format!(
+                "stream-{} at {},{} {}x{}",
+                stream.node_id,
+                stream.position[0],
+                stream.position[1],
+                stream.size[0],
+                stream.size[1]
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let g = &screen.geometry;
+    kinded(
+        ErrorKind::NotShared,
+        format!(
+            "monitor {} ({},{} {}x{}) is not shared in the portal session (shared: {shared})",
+            screen.id, g.x, g.y, g.width, g.height
+        ),
+    )
 }
 
 pub fn point_in_screen(screen: &ScreenInfo, x: i32, y: i32) -> bool {
@@ -1197,4 +1226,63 @@ pub fn point_in_screen(screen: &ScreenInfo, x: i32, y: i32) -> bool {
         && x < screen.geometry.x.saturating_add(screen.geometry.width)
         && y >= screen.geometry.y
         && y < screen.geometry.y.saturating_add(screen.geometry.height)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error_kind::kind_of;
+    use crate::model::Rect;
+
+    fn screen(id: &str, x: i32, y: i32, width: i32, height: i32) -> ScreenInfo {
+        ScreenInfo {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            geometry: Rect {
+                x,
+                y,
+                width,
+                height,
+            },
+            scale: Some(1.0),
+            refresh_millihz: None,
+            is_active: false,
+            is_primary: false,
+        }
+    }
+
+    fn stream(node_id: u32, x: i32, y: i32, w: i32, h: i32) -> PortalStream {
+        PortalStream {
+            node_id,
+            source_type: "monitor".to_owned(),
+            position: [x, y],
+            size: [w, h],
+        }
+    }
+
+    #[test]
+    fn a_shared_monitor_matches_its_stream() {
+        let streams = [
+            stream(41, 0, 0, 1920, 1080),
+            stream(42, -1920, 0, 1920, 1080),
+        ];
+        let chosen = match_stream_to_screen(&streams, &screen("DP-2", -1920, 0, 1920, 1080))
+            .unwrap()
+            .stream;
+        assert_eq!(chosen.node_id, 42);
+    }
+
+    #[test]
+    fn an_unshared_monitor_is_the_contract_not_shared_error() {
+        let streams = [stream(41, 0, 0, 1920, 1080)];
+        let error = match_stream_to_screen(&streams, &screen("DP-2", -1920, -240, 1920, 1200))
+            .err()
+            .unwrap();
+        assert_eq!(kind_of(&error), Some(ErrorKind::NotShared));
+        assert_eq!(
+            format!("{error:#}"),
+            "monitor DP-2 (-1920,-240 1920x1200) is not shared in the portal session \
+             (shared: stream-41 at 0,0 1920x1080)"
+        );
+    }
 }
