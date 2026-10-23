@@ -14,6 +14,7 @@ mod model;
 mod portal;
 mod session_overlay;
 mod settle;
+mod stop_marker;
 mod teach_overlay;
 mod token_store;
 mod util;
@@ -60,8 +61,9 @@ async fn main() {
     if let Err(error) = run(cli).await {
         // Same stderr text as anyhow's own `main` report; stdout stays empty.
         // The exit code is the contract's: 3 = monitor not shared, 4 = no
-        // live session, else 1. The kind is typed even when it came back
-        // from the session daemon (`error_kind` on the socket).
+        // live session, 5 = the user stopped screen sharing, else 1. The
+        // kind is typed even when it came back from the session daemon
+        // (`error_kind` on the socket).
         eprintln!("Error: {error:?}");
         std::process::exit(i32::from(error_kind::exit_code(error_kind::kind_of(
             &error,
@@ -75,6 +77,11 @@ async fn run(cli: Cli) -> Result<()> {
     let desktop_apps = DesktopAppService::new;
     let executor = ExecutorBackend::new;
     let portal = PortalBackend::new;
+
+    // Exit 5 before any KWin or portal work while the user's stop stands.
+    if needs_portal_session(&cli.command) {
+        stop_marker::refuse_if_stopped()?;
+    }
 
     match cli.command {
         #[cfg(feature = "mcp")]
@@ -317,6 +324,30 @@ async fn run(cli: Cli) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Input and capture commands: they act through the portal session, so the
+/// stopped-by-user marker refuses them (contract v1, exit 5). Clipboard and
+/// overlay-display requests are served by the session daemon too. Listing,
+/// window, app, teach-overlay and session-management commands keep working.
+fn needs_portal_session(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::PointerMove { .. }
+            | Command::PointerClick { .. }
+            | Command::PointerScroll { .. }
+            | Command::PointerDrag { .. }
+            | Command::KeySequence { .. }
+            | Command::Type { .. }
+            | Command::HoldKey { .. }
+            | Command::LeftMouseDown
+            | Command::LeftMouseUp
+            | Command::Screenshot { .. }
+            | Command::Zoom { .. }
+            | Command::ReadClipboard
+            | Command::WriteClipboard { .. }
+            | Command::SetOverlayDisplay { .. }
+    )
 }
 
 /// The daemon must never outlive its session: a PipeWire thread, clipboard

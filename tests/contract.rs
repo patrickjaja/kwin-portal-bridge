@@ -235,3 +235,64 @@ fn empty_xdg_dirs_count_as_unset() {
         "/tmp/kwin-portal-bridge/session.sock"
     );
 }
+
+impl Isolated {
+    fn marker(&self) -> PathBuf {
+        self.runtime.join("kwin-portal-bridge/stopped-by-user")
+    }
+
+    fn plant_marker(&self) {
+        std::fs::create_dir_all(self.runtime.join("kwin-portal-bridge")).unwrap();
+        std::fs::write(self.marker(), "1761200000\n").unwrap();
+    }
+}
+
+#[test]
+fn after_a_stop_by_the_user_input_and_capture_exit_5_fast() {
+    let env = Isolated::new();
+    env.plant_marker();
+    for args in [
+        &["pointer-move", "--x", "1", "--y", "1"][..],
+        &["pointer-click", "--x", "1", "--y", "1"],
+        &["key-sequence", "--keys", "ctrl+a"],
+        &["screenshot"],
+        &["left-mouse-up"],
+    ] {
+        let started = std::time::Instant::now();
+        let output = env.run(args);
+        let elapsed = started.elapsed();
+        assert_eq!(output.status.code(), Some(5), "{args:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{args:?}: {output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("screen sharing was stopped"), "{stderr}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "{args:?} took {elapsed:?}"
+        );
+    }
+    // Listing and session-management commands are not gated.
+    assert_eq!(env.run(&["session-end"]).status.code(), Some(0));
+}
+
+#[test]
+fn session_end_and_forget_session_remove_the_marker() {
+    let env = Isolated::new();
+    for command in ["session-end", "forget-session"] {
+        env.plant_marker();
+        assert!(env.marker().exists());
+        assert_eq!(env.json(&[command])["ok"], true, "{command}");
+        assert!(!env.marker().exists(), "{command} left the marker");
+        // Without the marker the same command is back to "no session".
+        assert_eq!(env.run(&["left-mouse-up"]).status.code(), Some(4));
+    }
+}
+
+#[test]
+fn doctor_reports_the_marker() {
+    let env = Isolated::new();
+    assert_eq!(env.json(&["doctor"])["stopped_by_user"], false);
+    env.plant_marker();
+    let report = env.json(&["doctor"]);
+    assert_eq!(report["stopped_by_user"], true);
+    assert!(env.marker().exists(), "doctor must not touch the marker");
+}

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::pin::Pin;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{sync::mpsc as std_mpsc, time::Duration};
 
@@ -7,6 +8,8 @@ use anyhow::{Context, Result, bail};
 use ashpd::desktop::PersistMode;
 use ashpd::desktop::remote_desktop::{RemoteDesktop, SelectDevicesOptions, StartOptions};
 use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions};
+use ashpd::zbus::export::futures_core::Stream;
+use ashpd::zbus::proxy::{CacheProperties, SignalStream};
 use ashpd::{AppID, register_host_app};
 use lamco_pipewire::{
     PipeWireThreadCommand, PipeWireThreadManager, PixelFormat, SourceType as PwSourceType,
@@ -48,6 +51,76 @@ pub struct LivePortalSession {
     pipewire: Option<PersistentPipeWire>,
     held_buttons: HashSet<i32>,
     latest_frames: HashMap<u32, VideoFrame>,
+    closed: Option<ClosedSignal>,
+}
+
+/// What `start_session` hands back.
+struct StartedSession {
+    manager: PortalManager,
+    session: PortalSessionHandle,
+    restore_token: Option<String>,
+    /// `None` when subscribing failed (logged); the session still works, a
+    /// stop from the screen-sharing indicator just goes unnoticed.
+    closed: Option<ClosedSignal>,
+}
+
+/// `org.freedesktop.portal.Session::Closed` for one portal session: the
+/// portal emits it when the session ends without us asking - the user
+/// stopped sharing from Plasma's screen-sharing indicator, or the compositor
+/// ended it. (Our own teardown never triggers it: xdg-desktop-portal does not
+/// signal a Close called by the session's owner.)
+///
+/// ashpd's `Session::receive_closed` returns a stream that borrows the
+/// session object, which lives inside lamco-portal's `PortalSessionHandle`
+/// for the whole daemon lifetime and is used mutably by every request. This
+/// subscribes to the same signal on the same connection (the portal sends it
+/// to the session owner's unique name only) with an owned proxy, so the
+/// watch can sit next to the session in the daemon loop.
+pub struct ClosedSignal {
+    _proxy: ashpd::zbus::Proxy<'static>,
+    stream: Pin<Box<SignalStream<'static>>>,
+}
+
+impl ClosedSignal {
+    async fn subscribe(
+        connection: &ashpd::zbus::Connection,
+        session: &ashpd::desktop::Session<RemoteDesktop>,
+    ) -> Result<Self> {
+        // `Session` serializes as its object path; the path accessor is
+        // crate-private in ashpd.
+        let path = match serde_json::to_value(session)
+            .context("failed to read the portal session path")?
+        {
+            serde_json::Value::String(path) => path,
+            other => bail!("unexpected portal session path {other}"),
+        };
+        let proxy: ashpd::zbus::Proxy<'static> = ashpd::zbus::proxy::Builder::new(connection)
+            .destination("org.freedesktop.portal.Desktop")?
+            .path(path)?
+            .interface("org.freedesktop.portal.Session")?
+            .cache_properties(CacheProperties::No)
+            .build()
+            .await
+            .context("failed to open the portal Session proxy")?;
+        let stream = proxy
+            .receive_signal("Closed")
+            .await
+            .context("failed to subscribe to the portal Session.Closed signal")?;
+        Ok(Self {
+            _proxy: proxy,
+            stream: Box::pin(stream),
+        })
+    }
+
+    /// Resolves when the portal closes the session. A stream that ends (the
+    /// bus connection itself went away) never resolves: that is not a stop
+    /// by the user, and the session's requests fail on their own.
+    pub async fn closed(&mut self) {
+        let next = std::future::poll_fn(|cx| self.stream.as_mut().poll_next(cx)).await;
+        if next.is_none() {
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 struct PersistentPipeWire {
@@ -219,7 +292,15 @@ impl PortalBackend {
 
     #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
     pub async fn capture_raw_frame_for_screen(&self, screen: &ScreenInfo) -> Result<CapturedFrame> {
-        let (manager, session, restore_token) = start_session().await?;
+        // This one-shot capture opens a portal session of its own; while the
+        // user's stop stands, it must not.
+        crate::stop_marker::refuse_if_stopped()?;
+        let StartedSession {
+            manager,
+            session,
+            restore_token,
+            ..
+        } = start_session().await?;
         let info = session_info(&session, restore_token);
         let target_stream = match_stream_to_screen(&info.streams, screen)?;
         let fd = dup_fd(session.pipewire_fd())?;
@@ -240,7 +321,12 @@ impl PortalBackend {
 
 impl LivePortalSession {
     pub async fn open() -> Result<Self> {
-        let (manager, session, restore_token) = start_session().await?;
+        let StartedSession {
+            manager,
+            session,
+            restore_token,
+            closed,
+        } = start_session().await?;
         Ok(Self {
             manager,
             session,
@@ -248,7 +334,13 @@ impl LivePortalSession {
             pipewire: None,
             held_buttons: HashSet::new(),
             latest_frames: HashMap::new(),
+            closed,
         })
+    }
+
+    /// The session's Closed watch, once (the daemon loop owns it).
+    pub fn take_closed_signal(&mut self) -> Option<ClosedSignal> {
+        self.closed.take()
     }
 
     pub fn info(&self) -> PortalSessionInfo {
@@ -681,37 +773,28 @@ impl LivePortalSession {
     }
 }
 
-async fn start_session() -> Result<(PortalManager, PortalSessionHandle, Option<String>)> {
+async fn start_session() -> Result<StartedSession> {
     let token_store = TokenStore::new()?;
     let saved_token = token_store.load().unwrap_or(None);
     // register_host_app("io.claude".parse()?).await?;
 
-    match try_start_session(saved_token.clone(), true).await {
-        Ok((manager, session, restore_token)) => {
-            if let Some(ref token) = restore_token {
-                token_store.save(token).ok();
-            }
-            Ok((manager, session, restore_token))
-        }
-        Err(error) if is_persistence_rejection(&error) => {
-            let (manager, session, restore_token) = try_start_session(None, false)
-                .await
-                .context("failed to create session after persistence fallback")?;
-
-            if let Some(ref token) = restore_token {
-                token_store.save(token).ok();
-            }
-
-            Ok((manager, session, restore_token))
-        }
-        Err(error) => Err(error),
+    let started = match try_start_session(saved_token.clone(), true).await {
+        Ok(started) => started,
+        Err(error) if is_persistence_rejection(&error) => try_start_session(None, false)
+            .await
+            .context("failed to create session after persistence fallback")?,
+        Err(error) => return Err(error),
+    };
+    if let Some(ref token) = started.restore_token {
+        token_store.save(token).ok();
     }
+    Ok(started)
 }
 
 async fn try_start_session(
     restore_token: Option<String>,
     with_persistence: bool,
-) -> Result<(PortalManager, PortalSessionHandle, Option<String>)> {
+) -> Result<StartedSession> {
     let portal_app_id = portal_app_id();
     let app_id = AppID::try_from(portal_app_id.as_str()).context("invalid portal app id")?;
     if let Err(error) = register_host_app(app_id).await {
@@ -753,6 +836,17 @@ async fn try_start_session(
         .create_session(Default::default())
         .await
         .context("failed to create the RemoteDesktop portal session")?;
+    // Subscribe before Start, so a stop right after the dialog is not missed.
+    let closed = match ClosedSignal::subscribe(remote_desktop.connection(), &session).await {
+        Ok(closed) => Some(closed),
+        Err(error) => {
+            eprintln!(
+                "[kwin-portal-bridge] cannot watch the portal session for a stop by the user: \
+                 {error:#}"
+            );
+            None
+        }
+    };
     let result = select_and_start(
         &remote_desktop,
         &config,
@@ -771,7 +865,12 @@ async fn try_start_session(
                 Some(session_id),
                 session,
             );
-            Ok((manager, handle, token))
+            Ok(StartedSession {
+                manager,
+                session: handle,
+                restore_token: token,
+                closed,
+            })
         }
         Err(error) => {
             // Close the half-built session so the portal does not keep stale

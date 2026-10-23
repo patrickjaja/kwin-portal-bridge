@@ -55,6 +55,7 @@ pub async fn report() -> Value {
         "restore_token_path": store.as_ref().map(|store| store.path().display().to_string()),
         "daemon_running": daemon.answering,
         "session_socket": socket_path().ok().map(|path| path.display().to_string()),
+        "stopped_by_user": crate::stop_marker::exists(),
         // Bridge-specific extras.
         "daemon_pid": daemon.pid,
         "current_desktop": env_or_null("XDG_CURRENT_DESKTOP"),

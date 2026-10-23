@@ -67,6 +67,17 @@ Things to keep in mind before pointing it at anything important:
   `token_removed`, `token_path`), succeeds when nothing was there to remove,
   leaves other state such as the exclude list alone, and needs no running
   KDE session.
+- **Noticing when the user stops sharing.** Plasma shows a screen-sharing
+  indicator while the session runs, and the user can end it there. The
+  daemon watches the portal session's `Session.Closed` signal; when it
+  fires it writes `$XDG_RUNTIME_DIR/kwin-portal-bridge/stopped-by-user`,
+  removes its socket and pidfile, restores hidden windows and exits. A
+  request in flight at that moment fails with exit 5, and while the marker
+  exists every input and capture command (pointer, keyboard, typing,
+  screenshot, zoom, clipboard) exits 5 at once without opening a portal
+  session. `screens`, `windows`, `doctor` and the other non-portal commands
+  keep working; `session-start`, `session-end` and `forget-session` remove
+  the marker.
 - **Clipboard integration** via `wl-clipboard-rs`, gated on the session
   lock.
 - **Desktop application integration**: enumerate installed `.desktop`
@@ -118,15 +129,17 @@ that claude-desktop-extra uses for every bridge:
 
 - `doctor` reports `contract: 1`, the version, whether this is a KDE Plasma
   Wayland session, whether KWin and the portal are on the session bus, the
-  restore-token and socket paths and whether the session daemon answers. It
-  exits 0 even with no session bus, and never opens a portal session.
+  restore-token and socket paths, whether the session daemon answers and
+  `stopped_by_user` (the user ended screen sharing). It exits 0 even with no
+  session bus, and never opens a portal session.
 - `session-start` prints `{"ok":true,"session":"daemon"}` (the restore token
   never reaches stdout), `session-end` prints `ok`, `ended` and `daemon`,
   `forget-session` adds `token_removed` and `token_path`.
 - Errors go to stderr with nothing on stdout. Exit codes: 1 runtime error,
   2 bad usage, 3 the target monitor is not shared in the portal session,
-  4 no live session (the daemon is gone). The daemon sends the error class
-  with its reply, so 3 and 4 hold for errors raised inside it.
+  4 no live session (the daemon is gone), 5 the user stopped screen sharing.
+  The daemon sends the error class with its reply, so 3, 4 and 5 hold for
+  errors raised inside it.
 - Coordinate flags take negative values (`pointer-move --x -1920 --y 0`),
   for monitors left of or above the origin.
 

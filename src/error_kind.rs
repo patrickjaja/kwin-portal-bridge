@@ -1,13 +1,15 @@
 //! Machine-readable error kinds for the Computer Use bridge CLI contract v1
 //! (claude-desktop-extra `docs/computer-use-bridge-contract.md`).
 //!
-//! Most failures are a generic exit 1. Two conditions get their own exit code
-//! so consumers can switch on it instead of matching text:
+//! Most failures are a generic exit 1. Three conditions get their own exit
+//! code so consumers can switch on it instead of matching text:
 //!
 //! - [`ErrorKind::NotShared`] (exit 3): the target monitor is not shared in
 //!   the live portal session.
 //! - [`ErrorKind::NoSession`] (exit 4): there is no live portal session (the
 //!   session daemon's session is gone).
+//! - [`ErrorKind::StoppedByUser`] (exit 5): the user stopped screen sharing
+//!   (the portal session was closed); see `stop_marker`.
 //!
 //! The kind is attached at the source as a [`KindError`] at the root of the
 //! `anyhow` chain, so added context does not lose it. Across the daemon
@@ -25,6 +27,8 @@ pub enum ErrorKind {
     NotShared,
     /// No live portal session.
     NoSession,
+    /// The user stopped screen sharing (the portal session was closed).
+    StoppedByUser,
 }
 
 impl ErrorKind {
@@ -33,6 +37,7 @@ impl ErrorKind {
         match self {
             Self::NotShared => "not_shared",
             Self::NoSession => "no_session",
+            Self::StoppedByUser => "stopped_by_user",
         }
     }
 
@@ -42,6 +47,7 @@ impl ErrorKind {
         match value {
             "not_shared" => Some(Self::NotShared),
             "no_session" => Some(Self::NoSession),
+            "stopped_by_user" => Some(Self::StoppedByUser),
             _ => None,
         }
     }
@@ -51,6 +57,7 @@ impl ErrorKind {
         match self {
             Self::NotShared => 3,
             Self::NoSession => 4,
+            Self::StoppedByUser => 5,
         }
     }
 }
@@ -101,12 +108,17 @@ mod tests {
     fn kinds_map_to_contract_exit_codes() {
         assert_eq!(exit_code(Some(ErrorKind::NotShared)), 3);
         assert_eq!(exit_code(Some(ErrorKind::NoSession)), 4);
+        assert_eq!(exit_code(Some(ErrorKind::StoppedByUser)), 5);
         assert_eq!(exit_code(None), 1);
     }
 
     #[test]
     fn wire_names_round_trip_and_unknown_is_generic() {
-        for kind in [ErrorKind::NotShared, ErrorKind::NoSession] {
+        for kind in [
+            ErrorKind::NotShared,
+            ErrorKind::NoSession,
+            ErrorKind::StoppedByUser,
+        ] {
             assert_eq!(ErrorKind::from_wire(kind.as_wire()), Some(kind));
         }
         assert_eq!(ErrorKind::from_wire("something_newer"), None);

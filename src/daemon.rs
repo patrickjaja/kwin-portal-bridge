@@ -22,7 +22,7 @@ use crate::model::{
     ClipboardReadResult, ClipboardWriteResult, PortalSessionInfo, ScreenInfo, ScreenshotCapture,
     ScreenshotResult,
 };
-use crate::portal::LivePortalSession;
+use crate::portal::{ClosedSignal, LivePortalSession};
 use crate::session_overlay::SessionOverlayProcess;
 use crate::teach_overlay::TeachOverlayProcess;
 
@@ -72,6 +72,10 @@ const PORTAL_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(1500);
 const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(5);
 /// Client-side budget for one daemon request (see `request_timeout`).
 const REQUEST_BASE_TIMEOUT: Duration = Duration::from_secs(25);
+/// How long a failed request waits for a Closed signal that explains it. The
+/// portal sends Closed before it starts refusing calls on the session, so it
+/// is normally queued already; a PipeWire stream can end a little earlier.
+const CLOSED_GRACE: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SessionRequest {
@@ -314,6 +318,8 @@ async fn daemon_state(socket: &Path) -> DaemonState {
 }
 
 pub async fn start_session_daemon() -> Result<PortalSessionInfo> {
+    // Starting a session is the user's answer to an earlier stop.
+    crate::stop_marker::remove();
     let socket = socket_path()?;
     match daemon_state(&socket).await {
         DaemonState::Up(info) => {
@@ -323,11 +329,17 @@ pub async fn start_session_daemon() -> Result<PortalSessionInfo> {
             // A daemon is already coming up (its consent dialog is probably
             // open). Spawning another would stack a second dialog; wait for
             // this one instead.
-            return wait_until_ready(&socket, || daemon.alive(), READY_TIMEOUT).await;
+            return wait_until_ready(
+                &socket,
+                || daemon.alive(),
+                READY_TIMEOUT,
+                &crate::stop_marker::path(),
+            )
+            .await;
         }
         DaemonState::Down => {}
     }
-    cleanup_stale_socket(&socket).await?;
+    clear_for_new_daemon(&socket, &crate::stop_marker::path()).await?;
 
     let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
     // The daemon's stderr goes to a log next to the socket (truncated per
@@ -363,6 +375,7 @@ pub async fn start_session_daemon() -> Result<PortalSessionInfo> {
         &socket,
         || child.try_wait().map(|s| s.is_none()).unwrap_or(true),
         READY_TIMEOUT,
+        &crate::stop_marker::path(),
     )
     .await
 }
@@ -376,10 +389,16 @@ pub async fn start_session_daemon() -> Result<PortalSessionInfo> {
 /// the dialog, so connect succeeds and the reply arrives the moment the daemon
 /// starts serving. Re-probing with fresh connections would queue one stale
 /// request per poll in the listen backlog.
+///
+/// A daemon that exited because the portal closed its session (the user
+/// stopped sharing before it became ready) left the stopped-by-user marker:
+/// that is reported as `stopped_by_user` (exit 5), so the caller does not
+/// share the screen again on its own.
 async fn wait_until_ready(
     socket: &Path,
     mut alive: impl FnMut() -> bool,
     limit: Duration,
+    marker: &Path,
 ) -> Result<PortalSessionInfo> {
     let deadline = Instant::now() + limit;
     loop {
@@ -398,9 +417,9 @@ async fn wait_until_ready(
                 },
                 _ = tokio::time::sleep(READY_POLL) => {}
             }
-            check_still_starting(&mut alive, deadline, limit)?;
+            check_still_starting(&mut alive, deadline, limit, marker)?;
         }
-        check_still_starting(&mut alive, deadline, limit)?;
+        check_still_starting(&mut alive, deadline, limit, marker)?;
         tokio::time::sleep(READY_POLL).await;
     }
 }
@@ -409,8 +428,12 @@ fn check_still_starting(
     alive: &mut impl FnMut() -> bool,
     deadline: Instant,
     limit: Duration,
+    marker: &Path,
 ) -> Result<()> {
     if !alive() {
+        if crate::stop_marker::exists_at(marker) {
+            return Err(crate::stop_marker::stopped_error());
+        }
         bail!(
             "session daemon exited before becoming ready (consent dialog declined or closed, \
              or the portal failed){}{}",
@@ -456,6 +479,9 @@ pub async fn stop_session_daemon() -> Result<Value> {
         None if answered => "shutdown-requested",
         None => "none",
     };
+    // After the reaping, so a daemon that recorded a stop on its way out
+    // does not leave the marker behind.
+    crate::stop_marker::remove();
     Ok(session_end_result(how))
 }
 
@@ -674,6 +700,7 @@ fn remove_pidfile_if(pid: i32) {
 }
 
 pub async fn prepare_session_socket() -> Result<PathBuf> {
+    crate::stop_marker::remove();
     let socket = socket_path()?;
     match daemon_state(&socket).await {
         DaemonState::Up(info) => {
@@ -684,8 +711,20 @@ pub async fn prepare_session_socket() -> Result<PathBuf> {
         }
         DaemonState::Down => {}
     }
-    cleanup_stale_socket(&socket).await?;
+    clear_for_new_daemon(&socket, &crate::stop_marker::path()).await?;
     Ok(socket)
+}
+
+/// The last step before a new daemon starts: drop a stale socket, and clear
+/// the stopped-by-user marker again. The callers cleared it before probing,
+/// but a daemon whose session was closed during that probe records its stop
+/// on the way out (and gives up its socket and pidfile, so the probe reads
+/// "down"); left in place, that marker would refuse every command of the
+/// session about to start.
+async fn clear_for_new_daemon(socket: &Path, marker: &Path) -> Result<()> {
+    cleanup_stale_socket(socket).await?;
+    crate::stop_marker::remove_at(marker);
+    Ok(())
 }
 
 pub async fn open_session_daemon(
@@ -771,6 +810,17 @@ pub async fn serve_open_session(
     mut overlay: SessionOverlayProcess,
     mut teach_overlay: TeachOverlayProcess,
 ) -> Result<()> {
+    // Files are removed only while they are still this daemon's: after a
+    // stop by the user they go early, and a new `session-start` may already
+    // have put its own in place while this teardown runs.
+    let socket_identity = file_identity(&socket);
+    let mut closed = session.take_closed_signal();
+    if closed.is_none() {
+        eprintln!(
+            "[kwin-portal-bridge] not watching for a stop from the screen-sharing indicator \
+             (no Closed subscription)"
+        );
+    }
     let serve_result = async {
         let mut capture_drain_tick = tokio::time::interval(Duration::from_millis(100));
         capture_drain_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -792,6 +842,10 @@ pub async fn serve_open_session(
                 }
                 _ = &mut terminate => {
                     eprintln!("[kwin-portal-bridge] SIGTERM");
+                    break;
+                }
+                _ = wait_closed(&mut closed) => {
+                    record_stop_by_user(&socket, socket_identity);
                     break;
                 }
                 accepted = listener.accept() => {
@@ -825,14 +879,38 @@ pub async fn serve_open_session(
                     // one is async (PipeWire waits poll), so the request is
                     // cancelled at its next await and the teardown below runs
                     // within its own limit instead of waiting for SIGKILL.
+                    // A stop by the user does too: the request is abandoned
+                    // and its caller gets `stopped_by_user`.
                     let handled = tokio::select! {
-                        handled = handle_request(&mut session, &mut overlay, request) => Some(handled),
-                        _ = &mut terminate => None,
+                        handled = handle_request(&mut session, &mut overlay, request) => Ok(handled),
+                        _ = &mut terminate => Err(Interrupt::Terminate),
+                        _ = wait_closed(&mut closed) => Err(Interrupt::Closed),
                     };
-                    let Some((response, should_shutdown)) = handled else {
-                        eprintln!("[kwin-portal-bridge] SIGTERM during a request; abandoning it");
-                        break;
+                    let (response, should_shutdown, stopped) = match handled {
+                        Ok((response, should_shutdown)) => {
+                            // A request that failed because the session was
+                            // just closed reports the stop, not the symptom.
+                            if !response.ok
+                                && response.error_kind.is_none()
+                                && closed.is_some()
+                                && tokio::time::timeout(CLOSED_GRACE, wait_closed(&mut closed)).await.is_ok()
+                            {
+                                (stopped_by_user_response(), true, true)
+                            } else {
+                                (response, should_shutdown, false)
+                            }
+                        }
+                        Err(Interrupt::Closed) => (stopped_by_user_response(), true, true),
+                        Err(Interrupt::Terminate) => {
+                            eprintln!("[kwin-portal-bridge] SIGTERM during a request; abandoning it");
+                            break;
+                        }
                     };
+                    if stopped {
+                        // The marker goes first, so a caller that retries
+                        // right after this reply already sees it.
+                        record_stop_by_user(&socket, socket_identity);
+                    }
                     match tokio::time::timeout(IPC_IO_TIMEOUT, write_response(&mut stream, response)).await {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => {
@@ -860,16 +938,83 @@ pub async fn serve_open_session(
     // indicator) alive after `session-end`. Overlays go first: they are
     // child processes that would outlive a hard exit.
     eprintln!("[kwin-portal-bridge] session daemon tearing down");
-    arm_teardown_watchdog(socket.clone());
+    arm_teardown_watchdog(socket.clone(), socket_identity);
     teach_overlay.shutdown();
     overlay.shutdown();
     if let Err(error) = restore_prepare_state() {
         eprintln!("[kwin-portal-bridge] failed to restore hidden windows on shutdown: {error:#}");
     }
     bounded_portal_shutdown(session).await;
-    std::fs::remove_file(&socket).ok();
+    remove_socket_if_own(&socket, socket_identity);
     remove_pidfile_if(std::process::id() as i32);
     serve_result
+}
+
+/// What cut a request short.
+enum Interrupt {
+    Terminate,
+    Closed,
+}
+
+/// Resolves when the portal closed the session; never without a watch.
+async fn wait_closed(closed: &mut Option<ClosedSignal>) {
+    match closed {
+        Some(closed) => closed.closed().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The user stopped screen sharing (portal `Session::Closed`). Record it in
+/// the marker, then drop the socket and pidfile at once, so no client queues
+/// on a daemon that is going away; the caller then runs the normal teardown.
+fn record_stop_by_user(socket: &Path, socket_identity: Option<FileIdentity>) {
+    match crate::stop_marker::write() {
+        Ok(path) => eprintln!(
+            "[kwin-portal-bridge] the portal closed the session (screen sharing stopped by the \
+             user or the desktop); recorded in {}",
+            path.display()
+        ),
+        Err(error) => eprintln!(
+            "[kwin-portal-bridge] the portal closed the session (screen sharing stopped by the \
+             user or the desktop); failed to record it: {error:#}"
+        ),
+    }
+    remove_socket_if_own(socket, socket_identity);
+    remove_pidfile_if(std::process::id() as i32);
+}
+
+fn stopped_by_user_response() -> SessionResponse {
+    SessionResponse {
+        ok: false,
+        result: None,
+        error: Some(crate::stop_marker::STOPPED_MESSAGE.to_owned()),
+        error_kind: Some(ErrorKind::StoppedByUser.as_wire().to_owned()),
+    }
+}
+
+/// Device and inode of a file, to recognise "still the one we created".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+fn file_identity(path: &Path) -> Option<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    Some(FileIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    })
+}
+
+/// Remove the session socket only while it is still the one this daemon
+/// bound; one it could not identify is left for the next `session-start`'s
+/// stale-socket cleanup.
+fn remove_socket_if_own(socket: &Path, own: Option<FileIdentity>) {
+    if own.is_some() && file_identity(socket) == own {
+        std::fs::remove_file(socket).ok();
+    }
 }
 
 async fn bounded_portal_shutdown(session: LivePortalSession) {
@@ -886,7 +1031,7 @@ async fn bounded_portal_shutdown(session: LivePortalSession) {
 }
 
 /// Hard-exit if the teardown that follows does not finish in time.
-fn arm_teardown_watchdog(socket: PathBuf) {
+fn arm_teardown_watchdog(socket: PathBuf, socket_identity: Option<FileIdentity>) {
     let spawned = std::thread::Builder::new()
         .name("teardown-watchdog".to_owned())
         .spawn(move || {
@@ -895,7 +1040,7 @@ fn arm_teardown_watchdog(socket: PathBuf) {
                 "[kwin-portal-bridge] teardown exceeded {}ms; exiting hard",
                 TEARDOWN_LIMIT.as_millis()
             );
-            std::fs::remove_file(&socket).ok();
+            remove_socket_if_own(&socket, socket_identity);
             remove_pidfile_if(std::process::id() as i32);
             // SAFETY: _exit skips atexit handlers and destructors on purpose:
             // whatever is stuck must not be able to block the exit.
@@ -910,14 +1055,28 @@ fn arm_teardown_watchdog(socket: PathBuf) {
 /// socket nobody listens on) is "no active portal session"; a daemon that is
 /// there but fails or does not answer in time returns that error - daemon-side
 /// errors verbatim, transport errors with the daemon log path.
+///
+/// While the stopped-by-user marker exists every request fails with
+/// `stopped_by_user` (exit 5) without touching the socket; a daemon that went
+/// away mid-request because the user stopped sharing reports the same.
 pub async fn request<T: DeserializeOwned>(request: SessionRequest) -> Result<T> {
+    crate::stop_marker::refuse_if_stopped()?;
     let socket = socket_path()?;
     let timeout = request_timeout(&request);
-    match request_daemon(&socket, &request, timeout).await {
+    let result = match request_daemon(&socket, &request, timeout).await {
         DaemonReply::Reply(result) => result,
         // The text stays: executors below contract 1 match on it.
         DaemonReply::NotRunning => Err(kinded(ErrorKind::NoSession, "no active portal session")),
-    }
+    };
+    result.map_err(|error| {
+        if kind_of(&error).is_none_or(|kind| kind == ErrorKind::NoSession)
+            && crate::stop_marker::exists()
+        {
+            crate::stop_marker::stopped_error()
+        } else {
+            error
+        }
+    })
 }
 
 /// Client-side budget for one daemon request. It must cover the daemon's own
@@ -1587,6 +1746,46 @@ mod tests {
         assert_eq!(reply_kind(Some("something_newer")).await.0, None);
     }
 
+    #[tokio::test]
+    async fn a_request_cut_short_by_a_stop_reaches_the_client_as_exit_5() {
+        let socket = temp_socket("stopped");
+        let server = answering_daemon(&socket, Duration::ZERO, stopped_by_user_response());
+        let error = exchange::<Value>(
+            UnixStream::connect(&socket).await.unwrap(),
+            &move_request(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+        assert_eq!(kind_of(&error), Some(ErrorKind::StoppedByUser));
+        assert_eq!(crate::error_kind::exit_code(kind_of(&error)), 5);
+        assert_eq!(error.to_string(), crate::stop_marker::STOPPED_MESSAGE);
+        std::fs::remove_file(&socket).ok();
+    }
+
+    #[test]
+    fn only_the_socket_this_daemon_bound_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("session.sock");
+        std::fs::write(&socket, "").unwrap();
+        let own = file_identity(&socket);
+        assert!(own.is_some());
+
+        // A new daemon replaced it: left alone.
+        std::fs::remove_file(&socket).unwrap();
+        std::fs::write(dir.path().join("other"), "").unwrap();
+        std::fs::rename(dir.path().join("other"), &socket).unwrap();
+        remove_socket_if_own(&socket, own);
+        assert!(socket.exists());
+        // Unknown identity: left alone.
+        remove_socket_if_own(&socket, None);
+        assert!(socket.exists());
+        // Its own: removed.
+        remove_socket_if_own(&socket, file_identity(&socket));
+        assert!(!socket.exists());
+    }
+
     #[test]
     fn a_classified_daemon_error_is_sent_with_its_kind() {
         let wrapped = Err::<(), _>(kinded(ErrorKind::NotShared, "monitor X is not shared"))
@@ -1634,10 +1833,50 @@ mod tests {
         assert_eq!(request_timeout(&typing), Duration::from_secs(25 + 17));
     }
 
+    /// A marker path that never exists.
+    fn no_marker() -> PathBuf {
+        std::env::temp_dir().join(format!("kpb-test-no-marker-{}", std::process::id()))
+    }
+
+    #[tokio::test]
+    async fn a_daemon_closed_before_ready_reports_the_stop_not_a_failure() {
+        let socket = temp_socket("ready-stopped");
+        let marker = socket.parent().unwrap().join("stopped-by-user");
+        std::fs::write(&marker, "1\n").unwrap();
+        let error = wait_until_ready(&socket, || false, Duration::from_secs(5), &marker)
+            .await
+            .unwrap_err();
+        assert_eq!(kind_of(&error), Some(ErrorKind::StoppedByUser));
+        assert_eq!(crate::error_kind::exit_code(kind_of(&error)), 5);
+        assert_eq!(error.to_string(), crate::stop_marker::STOPPED_MESSAGE);
+        // Still alive: the marker alone does not end the wait.
+        let error = wait_until_ready(&socket, || true, Duration::from_millis(400), &marker)
+            .await
+            .unwrap_err();
+        assert_eq!(kind_of(&error), None);
+        assert!(error.to_string().contains("still waiting"), "{error}");
+        std::fs::remove_dir_all(socket.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn a_stop_recorded_during_the_probe_is_cleared_before_the_new_daemon() {
+        let socket = temp_socket("clear-before-spawn");
+        let marker = socket.parent().unwrap().join("stopped-by-user");
+        // The closed daemon left its marker; its socket is gone or stale.
+        std::fs::write(&marker, "1\n").unwrap();
+        std::fs::write(&socket, "").unwrap();
+        clear_for_new_daemon(&socket, &marker).await.unwrap();
+        assert!(!marker.exists(), "the marker would refuse the new session");
+        assert!(!socket.exists(), "stale socket left behind");
+        // Nothing to clear: still fine.
+        clear_for_new_daemon(&socket, &marker).await.unwrap();
+        std::fs::remove_dir_all(socket.parent().unwrap()).ok();
+    }
+
     #[tokio::test]
     async fn ready_wait_reports_a_dead_daemon_as_exited() {
         let socket = temp_socket("ready-dead");
-        let error = wait_until_ready(&socket, || false, Duration::from_secs(5))
+        let error = wait_until_ready(&socket, || false, Duration::from_secs(5), &no_marker())
             .await
             .unwrap_err();
         assert!(
@@ -1654,7 +1893,7 @@ mod tests {
         let socket = temp_socket("ready-wait");
         let _listener = UnixListener::bind(&socket).unwrap();
         let started = Instant::now();
-        let error = wait_until_ready(&socket, || true, Duration::from_millis(400))
+        let error = wait_until_ready(&socket, || true, Duration::from_millis(400), &no_marker())
             .await
             .unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(2));
@@ -1680,7 +1919,7 @@ mod tests {
                 error_kind: None,
             },
         );
-        let info = wait_until_ready(&socket, || true, Duration::from_secs(5))
+        let info = wait_until_ready(&socket, || true, Duration::from_secs(5), &no_marker())
             .await
             .unwrap();
         assert_eq!(info.session_id, "test-session");
