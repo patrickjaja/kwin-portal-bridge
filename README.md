@@ -49,7 +49,13 @@ Things to keep in mind before pointing it at anything important:
   first time ("Allow restoring on future sessions" stays on); the restore
   token is stored under `$XDG_STATE_HOME/kwin-portal-bridge/` and every
   later session starts without a prompt. The session is held open by a
-  background daemon and torn down cleanly on exit. Persistence is
+  background daemon and torn down cleanly on exit. Every wait is bounded:
+  `session-start` waits up to 120 s for the consent dialog and reports a
+  declined dialog at once, each request has a client timeout, and
+  `session-end` reaps a daemon that does not answer (SIGTERM, then SIGKILL
+  of its process group). The daemon's pid and stderr live next to its
+  socket, in `$XDG_RUNTIME_DIR/kwin-portal-bridge/session.pid` and
+  `daemon.log`. Persistence is
   requested through `RemoteDesktop.SelectDevices` only - the portal
   refuses it on `ScreenCast.SelectSources` for a remote-desktop session,
   which is why the token was never stored before.

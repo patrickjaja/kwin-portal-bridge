@@ -20,8 +20,15 @@ use crate::model::{
     PortalActionResult, PortalSessionInfo, PortalStream, ScreenInfo, ScreenshotCapture,
     ScreenshotResult, StreamSelection, TypeActionResult,
 };
+use crate::settle::{Arrival, SETTLE_DEADLINE, SETTLE_QUIET, settle};
 use crate::token_store::TokenStore;
 
+/// How long PipeWire may take to answer a CreateStream command.
+const CREATE_STREAM_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a fresh stream may take to deliver its first frame.
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+/// Poll interval of the daemon's async PipeWire waits.
+const PIPEWIRE_POLL: Duration = Duration::from_millis(5);
 const DEFAULT_PORTAL_APP_ID: &str = "com.anthropic.Claude";
 const PORTAL_APP_ID_ENV: &str = "KWIN_PORTAL_BRIDGE_APP_ID";
 
@@ -601,30 +608,58 @@ impl LivePortalSession {
     pub async fn capture_screen_frame(&mut self, screen: &ScreenInfo) -> Result<CapturedFrame> {
         let info = self.info();
         let target_stream = match_stream_to_screen(&info.streams, screen)?;
+        // Every wait below is async (polling the PipeWire channels), never a
+        // blocking recv: the daemon serves one request at a time on its task,
+        // and SIGTERM must be able to cancel a capture at its next await.
         {
             let pipewire = self.ensure_pipewire()?;
-            ensure_pipewire_stream(pipewire, &target_stream)?;
+            ensure_pipewire_stream_async(pipewire, &target_stream).await?;
         }
         self.drain_capture_backlog();
 
-        if let Some(frame) = self
-            .latest_frames
-            .get(&target_stream.stream.node_id)
-            .cloned()
-        {
+        let node_id = target_stream.stream.node_id;
+        let Self {
+            pipewire,
+            latest_frames,
+            ..
+        } = self;
+        let manager = &pipewire
+            .as_ref()
+            .expect("pipewire initialized above")
+            .manager;
+        if let Some(stored) = latest_frames.get(&node_id).cloned() {
+            // A running stream: wait for it to settle (see `crate::settle`) so
+            // a capture right after an action shows the repaint, not the
+            // pre-action frame; on a static screen the stored frame is used.
+            let settled = settle(
+                SETTLE_QUIET,
+                SETTLE_DEADLINE,
+                PIPEWIRE_POLL,
+                || match manager.recv_frame_timeout(Duration::ZERO) {
+                    Some(frame) if frame.frame_id == u64::from(node_id) => Arrival::Target(frame),
+                    Some(frame) => {
+                        let stream_id = u32::try_from(frame.frame_id).unwrap_or_default();
+                        latest_frames.insert(stream_id, frame);
+                        Arrival::Other
+                    }
+                    None => Arrival::Nothing,
+                },
+            )
+            .await;
+            let frame = match settled {
+                Some(fresh) => {
+                    latest_frames.insert(node_id, fresh.clone());
+                    fresh
+                }
+                None => stored,
+            };
             return Ok(CapturedFrame { frame });
         }
 
-        let frame = {
-            let pipewire = self.ensure_pipewire()?;
-            recv_frame_for_stream(
-                &pipewire.manager,
-                target_stream.stream.node_id,
-                Duration::from_secs(10),
-            )?
-        };
-        self.latest_frames
-            .insert(target_stream.stream.node_id, frame.clone());
+        let frame =
+            recv_frame_for_stream_async(manager, latest_frames, node_id, FIRST_FRAME_TIMEOUT)
+                .await?;
+        latest_frames.insert(node_id, frame.clone());
 
         Ok(CapturedFrame { frame })
     }
@@ -918,12 +953,15 @@ fn char_to_keysym(ch: char) -> Result<i32> {
     i32::try_from(keysym).context("keysym did not fit into i32")
 }
 
-fn ensure_pipewire_stream(
+type CreateStreamReply = std_mpsc::Receiver<lamco_pipewire::Result<()>>;
+
+/// Ask the PipeWire thread to create `stream`; `None` when it already runs.
+fn send_create_stream(
     pipewire: &mut PersistentPipeWire,
     stream: &StreamSelection,
-) -> Result<()> {
+) -> Result<Option<CreateStreamReply>> {
     if pipewire.active_streams.contains(&stream.stream.node_id) {
-        return Ok(());
+        return Ok(None);
     }
 
     let (response_tx, response_rx) = std_mpsc::sync_channel(1);
@@ -946,14 +984,88 @@ fn ensure_pipewire_stream(
             config,
             response_tx,
         })?;
+    Ok(Some(response_rx))
+}
 
-    response_rx
-        .recv()
-        .context("PipeWire create-stream response channel closed")?
+/// Bounded: a PipeWire thread that never answers must not wedge the daemon.
+fn finish_create_stream(
+    pipewire: &mut PersistentPipeWire,
+    node_id: u32,
+    reply: std::result::Result<lamco_pipewire::Result<()>, std_mpsc::RecvTimeoutError>,
+) -> Result<()> {
+    reply
+        .map_err(|error| match error {
+            std_mpsc::RecvTimeoutError::Timeout => anyhow::anyhow!(
+                "PipeWire did not answer stream creation within {}s",
+                CREATE_STREAM_TIMEOUT.as_secs()
+            ),
+            std_mpsc::RecvTimeoutError::Disconnected => {
+                anyhow::anyhow!("PipeWire create-stream response channel closed")
+            }
+        })?
         .context("PipeWire rejected stream creation")?;
-
-    pipewire.active_streams.insert(stream.stream.node_id);
+    pipewire.active_streams.insert(node_id);
     Ok(())
+}
+
+/// Blocking variant for the one-shot (daemon-less) capture thread.
+fn ensure_pipewire_stream(
+    pipewire: &mut PersistentPipeWire,
+    stream: &StreamSelection,
+) -> Result<()> {
+    let Some(reply) = send_create_stream(pipewire, stream)? else {
+        return Ok(());
+    };
+    let reply = reply.recv_timeout(CREATE_STREAM_TIMEOUT);
+    finish_create_stream(pipewire, stream.stream.node_id, reply)
+}
+
+/// Async variant for the daemon (see `capture_screen_frame`).
+async fn ensure_pipewire_stream_async(
+    pipewire: &mut PersistentPipeWire,
+    stream: &StreamSelection,
+) -> Result<()> {
+    let Some(reply) = send_create_stream(pipewire, stream)? else {
+        return Ok(());
+    };
+    let deadline = std::time::Instant::now() + CREATE_STREAM_TIMEOUT;
+    let reply = loop {
+        match reply.try_recv() {
+            Ok(result) => break Ok(result),
+            Err(std_mpsc::TryRecvError::Disconnected) => {
+                break Err(std_mpsc::RecvTimeoutError::Disconnected);
+            }
+            Err(std_mpsc::TryRecvError::Empty) if std::time::Instant::now() >= deadline => {
+                break Err(std_mpsc::RecvTimeoutError::Timeout);
+            }
+            Err(std_mpsc::TryRecvError::Empty) => tokio::time::sleep(PIPEWIRE_POLL).await,
+        }
+    };
+    finish_create_stream(pipewire, stream.stream.node_id, reply)
+}
+
+/// Async first-frame wait for the daemon: polls the frame channel, storing
+/// other streams' frames instead of dropping them.
+async fn recv_frame_for_stream_async(
+    manager: &PipeWireThreadManager,
+    latest_frames: &mut HashMap<u32, VideoFrame>,
+    stream_id: u32,
+    timeout: Duration,
+) -> Result<VideoFrame> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        while let Some(frame) = manager.recv_frame_timeout(Duration::ZERO) {
+            if frame.frame_id == u64::from(stream_id) {
+                return Ok(frame);
+            }
+            let other = u32::try_from(frame.frame_id).unwrap_or_default();
+            latest_frames.insert(other, frame);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(frame_timeout_error(manager, stream_id));
+        }
+        tokio::time::sleep(PIPEWIRE_POLL).await;
+    }
 }
 
 fn recv_frame_for_stream(
@@ -976,6 +1088,10 @@ fn recv_frame_for_stream(
         }
     }
 
+    Err(frame_timeout_error(manager, stream_id))
+}
+
+fn frame_timeout_error(manager: &PipeWireThreadManager, stream_id: u32) -> anyhow::Error {
     let states = manager
         .drain_state_events()
         .into_iter()
@@ -988,7 +1104,7 @@ fn recv_frame_for_stream(
         format!("state events: {}", states.join(", "))
     };
 
-    bail!("timed out waiting for PipeWire frame on stream {stream_id} ({states_suffix})");
+    anyhow::anyhow!("timed out waiting for PipeWire frame on stream {stream_id} ({states_suffix})")
 }
 
 fn drain_pending_frames(

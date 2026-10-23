@@ -11,6 +11,7 @@ mod mcp;
 mod model;
 mod portal;
 mod session_overlay;
+mod settle;
 mod teach_overlay;
 mod token_store;
 mod util;
@@ -64,14 +65,15 @@ async fn main() -> Result<()> {
                 let (listener, session, overlay, teach_overlay) =
                     open_session_daemon(&socket).await?;
                 print_json(&session.info())?;
-                serve_open_session(socket, listener, session, overlay, teach_overlay).await?;
+                exit_after_serve(
+                    serve_open_session(socket, listener, session, overlay, teach_overlay).await,
+                );
             } else {
                 print_json(&start_session_daemon().await?)?;
             }
         }
         Command::SessionEnd => {
-            stop_session_daemon().await?;
-            print_json(&serde_json::json!({ "ended": true }))?;
+            print_json(&stop_session_daemon().await?)?;
         }
         Command::Screens => {
             print_json(&kwin().list_screens()?)?;
@@ -238,7 +240,7 @@ async fn main() -> Result<()> {
             )?;
         }
         Command::ServeSession { socket } => {
-            serve_session_daemon(std::path::PathBuf::from(socket)).await?;
+            exit_after_serve(serve_session_daemon(std::path::PathBuf::from(socket)).await);
         }
         Command::SessionOverlay { output } => {
             run_session_overlay(output.as_deref())?;
@@ -286,4 +288,21 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The daemon must never outlive its session: a PipeWire thread, clipboard
+/// worker or portal call that refuses to wind down would otherwise keep the
+/// process (and the screen-sharing indicator) alive after `session-end`, since
+/// the tokio runtime waits for blocking workers on drop. Hard-exit instead.
+fn exit_after_serve(result: Result<()>) -> ! {
+    match result {
+        Ok(()) => {
+            eprintln!("[kwin-portal-bridge] session daemon exited");
+            std::process::exit(0)
+        }
+        Err(error) => {
+            eprintln!("[kwin-portal-bridge] session daemon failed: {error:#}");
+            std::process::exit(1)
+        }
+    }
 }
