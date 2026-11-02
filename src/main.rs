@@ -1,3 +1,4 @@
+mod ax;
 mod capture;
 mod cli;
 mod daemon;
@@ -24,7 +25,7 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use crate::capture::CaptureBackend;
-use crate::cli::{Cli, Command};
+use crate::cli::{AxActionKind, Cli, Command};
 use crate::daemon::{
     forget_session, open_session_daemon, prepare_session_socket, serve_open_session,
     serve_session_daemon, start_session_daemon, stop_session_daemon,
@@ -52,12 +53,17 @@ fn session_started() -> serde_json::Value {
 
 #[tokio::main]
 async fn main() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .try_init();
-
     // Bad usage exits 2 inside `parse`.
     let cli = Cli::parse();
+
+    // No tracing for the AT-SPI commands, whatever RUST_LOG says: the
+    // subscriber writes to stdout, which must stay one JSON value, and
+    // element data or set-text content must never be printed.
+    if !is_ax_command(&cli.command) {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env())
+            .try_init();
+    }
     if let Err(error) = run(cli).await {
         // Same stderr text as anyhow's own `main` report; stdout stays empty.
         // The exit code is the contract's: 3 = monitor not shared, 4 = no
@@ -304,6 +310,51 @@ async fn run(cli: Cli) -> Result<()> {
         Command::TeachWaitEvent => {
             print_json(&wait_teach_event()?)?;
         }
+        // AT-SPI: direct, no daemon, no portal (see `ax`).
+        Command::AxEnable { holder_pid } => {
+            print_json(&cu_atspi::enable(holder_pid).await?)?;
+        }
+        Command::AxRestore { holder_pid } => {
+            print_json(&cu_atspi::restore(holder_pid).await?)?;
+        }
+        Command::AxFind {
+            window,
+            role,
+            title_contains,
+            all,
+            include_hidden,
+            max_nodes,
+            max_depth,
+        } => {
+            let opts = ax::FindOptions {
+                role,
+                title_contains,
+                all,
+                include_hidden,
+                max_nodes,
+                max_depth,
+            };
+            print_json(&ax::find(&kwin(), &window, opts).await?)?;
+        }
+        Command::AxAction {
+            scope,
+            element_ref,
+            action,
+        } => {
+            // set-text reads its text from stdin only (never argv, never logged).
+            let action = match action {
+                AxActionKind::Click => cu_atspi::Action::Click,
+                AxActionKind::Focus => cu_atspi::Action::Focus,
+                AxActionKind::SetText => match ax::read_stdin_text()? {
+                    Ok(text) => cu_atspi::Action::SetText(text),
+                    Err(ax::StdinNotUtf8) => {
+                        eprintln!("Error: the text on stdin is not valid UTF-8");
+                        std::process::exit(2);
+                    }
+                },
+            };
+            print_json(&cu_atspi::action(&element_ref, &action, &scope).await?)?;
+        }
         Command::TeachOverlayPreview {
             payload,
             display,
@@ -324,6 +375,16 @@ async fn run(cli: Cli) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn is_ax_command(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::AxEnable { .. }
+            | Command::AxRestore { .. }
+            | Command::AxFind { .. }
+            | Command::AxAction { .. }
+    )
 }
 
 /// Input and capture commands: they act through the portal session, so the

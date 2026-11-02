@@ -4,6 +4,7 @@ version = "0.2.8"
 edition = "2024"
 
 [dependencies]
+cu-atspi = { git = "https://github.com/patrickjaja/cu-atspi", rev = "a390259e9209fda8bb518a8ef253198ba3435ef0" }
 anyhow = "1.0.103"
 ashpd = "0.13.12"
 base64 = "0.22.1"

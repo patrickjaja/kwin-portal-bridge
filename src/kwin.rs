@@ -8,6 +8,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use dbus::blocking::{Connection, SyncConnection};
 use dbus::channel::MatchingReceiver;
 use dbus::message::MatchRule;
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 use crate::model::{
@@ -144,6 +145,20 @@ impl KWinBackend {
         parse_payload(payload)
     }
 
+    /// One window by id for `ax-find`: identity plus frame and client
+    /// geometry (KWin logical px) and whether it is an XWayland client.
+    /// `None` when KWin has no window with that id. Kept apart from `windows`,
+    /// whose output shape is frozen by the bridge contract.
+    pub fn ax_window(&self, window_id: &str) -> Result<Option<AxWindow>> {
+        let script = format!(
+            "const TARGET_WINDOW = {};\n{SCRIPT_AX_WINDOW}",
+            js_string(window_id)?
+        );
+        let payload = run_json_script("kwin-portal-bridge-ax-window", &script)?;
+        let lookup: AxWindowLookup = parse_payload(payload)?;
+        Ok(if lookup.found { lookup.window } else { None })
+    }
+
     pub fn set_window_keep_above(
         &self,
         window_id: &str,
@@ -157,6 +172,46 @@ impl KWinBackend {
         let payload = run_json_script("kwin-portal-bridge-set-window-keep-above", &script)?;
         parse_payload(payload)
     }
+}
+
+/// What `SCRIPT_AX_WINDOW` reports for one window.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AxWindow {
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub desktop_file_name: Option<String>,
+    #[serde(default)]
+    pub resource_class: Option<String>,
+    #[serde(default)]
+    pub output: Option<String>,
+    /// `frameGeometry`: decorated window rect, global logical px.
+    pub frame_geometry: Rect,
+    /// `clientGeometry`: the rect without server-side decorations.
+    #[serde(default)]
+    pub client_geometry: Option<Rect>,
+    /// `x11Client` (XWayland); null when KWin exposes neither it nor
+    /// `waylandClient` nor a recognisable class name.
+    #[serde(default)]
+    pub x11: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AxWindowLookup {
+    found: bool,
+    #[serde(default)]
+    window: Option<AxWindow>,
+}
+
+/// A JS string literal for a generated KWin script. serde_json leaves
+/// U+2028/U+2029 unescaped, which older JS engines reject inside literals.
+fn js_string(value: &str) -> Result<String> {
+    Ok(serde_json::to_string(value)?
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029"))
 }
 
 fn parse_payload<T: DeserializeOwned>(payload: String) -> Result<T> {
@@ -490,6 +545,55 @@ try {
 }
 "#;
 
+// The class name (`KWin::X11Window(0x...)` / `KWin::XdgToplevelWindow(0x...)`
+// from QJSEngine's QObject toString) is the working path on Plasma 6: the
+// x11Client/waylandClient properties are absent there (KWin 6.7.2). They are
+// still read first for older KWin builds that expose them.
+const SCRIPT_AX_WINDOW: &str = r#"
+try {
+    let target = null;
+    workspace.windowList().forEach((window) => {
+        if (String(window.internalId) === TARGET_WINDOW) {
+            target = window;
+        }
+    });
+
+    if (!target) {
+        bridgeResult({ found: false });
+    } else {
+        let x11 = null;
+        if (typeof target.x11Client === "boolean") {
+            x11 = target.x11Client;
+        } else if (typeof target.waylandClient === "boolean") {
+            x11 = !target.waylandClient;
+        } else {
+            const className = String(target);
+            if (/X11Window|X11Client/.test(className)) {
+                x11 = true;
+            } else if (/XdgToplevelWindow|WaylandWindow/.test(className)) {
+                x11 = false;
+            }
+        }
+        bridgeResult({
+            found: true,
+            window: {
+                id: String(target.internalId),
+                title: target.caption || "",
+                pid: target.pid || null,
+                desktop_file_name: target.desktopFileName || null,
+                resource_class: target.resourceClass || null,
+                output: target.output ? target.output.name : null,
+                frame_geometry: bridgeRect(target.frameGeometry),
+                client_geometry: target.clientGeometry ? bridgeRect(target.clientGeometry) : null,
+                x11: x11
+            }
+        });
+    }
+} catch (error) {
+    bridgeError(String(error));
+}
+"#;
+
 const SCRIPT_CURSOR: &str = r#"
 try {
     const pos =
@@ -604,6 +708,46 @@ try {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ax_window_lookup_decodes_the_script_payload() {
+        let lookup: AxWindowLookup = serde_json::from_str(
+            r#"{"found":true,"window":{"id":"{a1}","title":"Kate","pid":4242,
+                "desktop_file_name":"org.kde.kate","resource_class":"kate","output":"DP-1",
+                "frame_geometry":{"x":100,"y":50,"width":800,"height":630},
+                "client_geometry":{"x":100,"y":80,"width":800,"height":600},"x11":false}}"#,
+        )
+        .unwrap();
+        assert!(lookup.found);
+        let window = lookup.window.unwrap();
+        assert_eq!(window.client_geometry.unwrap().y, 80);
+        assert_eq!(window.x11, Some(false));
+
+        let missing: AxWindowLookup = serde_json::from_str(r#"{"found":false}"#).unwrap();
+        assert!(!missing.found && missing.window.is_none());
+
+        // Older KWin: no client geometry, no client-type property.
+        let sparse: AxWindowLookup = serde_json::from_str(
+            r#"{"found":true,"window":{"id":"w","pid":null,
+                "frame_geometry":{"x":0,"y":0,"width":10,"height":10},
+                "client_geometry":null,"x11":null}}"#,
+        )
+        .unwrap();
+        let window = sparse.window.unwrap();
+        assert!(window.client_geometry.is_none() && window.x11.is_none());
+        assert_eq!(window.title, "");
+    }
+
+    #[test]
+    fn js_string_escapes_hostile_ids() {
+        assert_eq!(js_string("a\"b").unwrap(), r#""a\"b""#);
+        assert_eq!(js_string("x\u{2028}y").unwrap(), r#""x\u2028y""#);
+        let script = render_script(
+            ":1.1",
+            &format!("const TARGET_WINDOW = {};", js_string("}\n").unwrap()),
+        );
+        assert!(script.contains(r#"const TARGET_WINDOW = "}\n";"#));
+    }
 
     // Regression guard for https://github.com/mosi0815/kwin-portal-bridge/issues/1:
     // KWin's QJSEngine rejects the header with "Variable 'DBUS_DESTINATION' is

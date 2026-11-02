@@ -4,7 +4,8 @@
 //! Always exits 0 with one JSON object. Never opens a portal session, never
 //! shows a dialog and never creates files: the backend check is two cheap
 //! session-bus name queries under a short timeout, the daemon check one ping
-//! on its socket.
+//! on its socket, the `atspi` key `cu_atspi::doctor` (read only, except that
+//! it restores IsEnabled for a lease whose holders all died).
 
 use std::sync::mpsc;
 use std::time::Duration;
@@ -36,7 +37,9 @@ pub async fn report() -> Value {
     let restore_token_present = store
         .as_ref()
         .is_some_and(|store| matches!(store.load(), Ok(Some(_))));
-    let daemon = probe_daemon(DAEMON_PING_TIMEOUT).await;
+    // The accessibility probe has its own 5 s deadline and never fails.
+    let (daemon, atspi) =
+        tokio::join!(probe_daemon(DAEMON_PING_TIMEOUT), crate::ax::doctor_atspi());
     let name_state = |pick: fn(&BusProbe) -> NameState| {
         bus.as_ref()
             .map_or(Value::Null, |bus| Value::from(pick(bus).as_str()))
@@ -64,6 +67,8 @@ pub async fn report() -> Value {
         "kwin": name_state(|bus| bus.kwin),
         "portal": name_state(|bus| bus.portal),
         "portal_kde_backend": name_state(|bus| bus.portal_kde),
+        // Optional (#306): AT-SPI state; absent = no accessibility support.
+        "atspi": atspi,
     })
 }
 

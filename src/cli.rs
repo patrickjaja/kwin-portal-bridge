@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -9,6 +9,15 @@ use clap::{Parser, Subcommand};
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// `ax-action --action` values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AxActionKind {
+    Click,
+    Focus,
+    /// Text comes from stdin (UTF-8, whole stdin, no trimming).
+    SetText,
 }
 
 #[derive(Debug, Subcommand)]
@@ -243,6 +252,42 @@ pub enum Command {
         #[arg(long)]
         auto_exit_ms: Option<u64>,
     },
+    /// Turn accessibility on for the Claude process (leased; screen readers untouched).
+    AxEnable {
+        #[arg(long)]
+        holder_pid: u32,
+    },
+    /// Release the accessibility lease of a holder.
+    AxRestore {
+        #[arg(long)]
+        holder_pid: u32,
+    },
+    /// List a window's accessible elements (AT-SPI).
+    AxFind {
+        #[arg(long)]
+        window: String,
+        #[arg(long)]
+        role: Option<String>,
+        #[arg(long)]
+        title_contains: Option<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        include_hidden: bool,
+        #[arg(long)]
+        max_nodes: Option<usize>,
+        #[arg(long)]
+        max_depth: Option<u32>,
+    },
+    /// Act on an element returned by `ax-find` (click, focus, set-text via stdin).
+    AxAction {
+        #[arg(long)]
+        scope: String,
+        #[arg(long = "ref")]
+        element_ref: String,
+        #[arg(long, value_enum)]
+        action: AxActionKind,
+    },
 }
 
 #[cfg(test)]
@@ -341,6 +386,120 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn ax_commands_parse() {
+        assert!(matches!(
+            parse(&["ax-enable", "--holder-pid", "4242"]),
+            Command::AxEnable { holder_pid: 4242 }
+        ));
+        assert!(matches!(
+            parse(&["ax-restore", "--holder-pid", "1"]),
+            Command::AxRestore { holder_pid: 1 }
+        ));
+        let Command::AxFind {
+            window,
+            role,
+            title_contains,
+            all,
+            include_hidden,
+            max_nodes,
+            max_depth,
+        } = parse(&[
+            "ax-find",
+            "--window",
+            "{3f2a-uuid}",
+            "--role",
+            "AXButton",
+            "--title-contains",
+            "Save",
+            "--all",
+            "--include-hidden",
+            "--max-nodes",
+            "500",
+            "--max-depth",
+            "10",
+        ])
+        else {
+            panic!("expected ax-find");
+        };
+        assert_eq!(window, "{3f2a-uuid}");
+        assert_eq!(role.as_deref(), Some("AXButton"));
+        assert_eq!(title_contains.as_deref(), Some("Save"));
+        assert!(all && include_hidden);
+        assert_eq!((max_nodes, max_depth), (Some(500), Some(10)));
+
+        let Command::AxFind {
+            role,
+            all,
+            max_nodes,
+            ..
+        } = parse(&["ax-find", "--window", "w"])
+        else {
+            panic!("expected ax-find");
+        };
+        assert!(role.is_none() && !all && max_nodes.is_none());
+    }
+
+    #[test]
+    fn ax_action_takes_no_text_on_argv() {
+        let Command::AxAction {
+            scope,
+            element_ref,
+            action,
+        } = parse(&[
+            "ax-action",
+            "--scope",
+            "v1|:1.42|/org/a11y/atspi/accessible/1|4242",
+            "--ref",
+            ":1.42/org/a11y/atspi/accessible/5",
+            "--action",
+            "set-text",
+        ])
+        else {
+            panic!("expected ax-action");
+        };
+        assert_eq!(scope, "v1|:1.42|/org/a11y/atspi/accessible/1|4242");
+        assert_eq!(element_ref, ":1.42/org/a11y/atspi/accessible/5");
+        assert_eq!(action, AxActionKind::SetText);
+        for kind in ["click", "focus"] {
+            assert!(matches!(
+                parse(&["ax-action", "--scope", "s", "--ref", "r", "--action", kind]),
+                Command::AxAction { .. }
+            ));
+        }
+        // The text never travels on argv.
+        for argv in [
+            &[
+                "ax-action",
+                "--scope",
+                "s",
+                "--ref",
+                "r",
+                "--action",
+                "set-text",
+                "--text",
+                "x",
+            ][..],
+            &[
+                "ax-action",
+                "--scope",
+                "s",
+                "--ref",
+                "r",
+                "--action",
+                "type",
+            ][..],
+            &["ax-action", "--ref", "r", "--action", "click"][..],
+            &["ax-enable"][..],
+            &["ax-find"][..],
+        ] {
+            let mut full = vec!["kwin-portal-bridge"];
+            full.extend_from_slice(argv);
+            let error = Cli::try_parse_from(full).unwrap_err();
+            assert_eq!(error.exit_code(), 2, "{argv:?}");
+        }
     }
 
     #[test]

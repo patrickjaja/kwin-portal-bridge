@@ -296,3 +296,81 @@ fn doctor_reports_the_marker() {
     assert_eq!(report["stopped_by_user"], true);
     assert!(env.marker().exists(), "doctor must not touch the marker");
 }
+
+#[test]
+fn doctor_has_an_atspi_key_without_a_bus() {
+    let doctor = Isolated::new().json(&["doctor"]);
+    let atspi = &doctor["atspi"];
+    assert_eq!(atspi["bus"], Value::Bool(false), "{atspi}");
+    assert!(atspi["error"].is_string(), "{atspi}");
+}
+
+#[test]
+fn ax_action_set_text_rejects_invalid_utf8_and_argv_text() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let env = Isolated::new();
+    let mut child = Command::new(BIN)
+        .args([
+            "ax-action",
+            "--scope",
+            "s",
+            "--ref",
+            "r",
+            "--action",
+            "set-text",
+        ])
+        .env_clear()
+        .env("HOME", &env.home)
+        .env("XDG_STATE_HOME", &env.state)
+        .env("XDG_RUNTIME_DIR", &env.runtime)
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&[0xff, 0xfe])
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+
+    let output = env.run(&[
+        "ax-action",
+        "--scope",
+        "s",
+        "--ref",
+        "r",
+        "--action",
+        "set-text",
+        "--text",
+        "secret",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+}
+
+#[test]
+fn ax_commands_print_one_json_value_even_with_rust_log() {
+    let env = Isolated::new();
+    let output = Command::new(BIN)
+        .args(["ax-enable", "--holder-pid", "1"])
+        .env_clear()
+        .env("HOME", &env.home)
+        .env("XDG_STATE_HOME", &env.state)
+        .env("XDG_RUNTIME_DIR", &env.runtime)
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
+        .env("RUST_LOG", "trace")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let value: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("stdout is not one JSON value ({error}): {output:?}"));
+    assert_eq!(value["unavailable"], "no_atspi_bus");
+}
