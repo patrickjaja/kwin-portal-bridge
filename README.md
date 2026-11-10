@@ -255,7 +255,8 @@ Computer Use" with no shortcut.
 
 `doctor` reports `abortWatch`: available when `org.kde.kglobalaccel` is
 running on the session bus and `XDG_RUNTIME_DIR` is set. It never registers
-anything.
+anything. `abortWatch.consumes` is `true` when available (kglobalaccel takes
+Escape from applications while armed), `null` otherwise.
 
 Tests: `tests/abort_watch.rs` drives the binary against a mock kglobalaccel
 (Equal/Shadows matching as in kglobalacceld) on private `dbus-daemon`s (CI

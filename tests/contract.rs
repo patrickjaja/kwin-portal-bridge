@@ -382,6 +382,7 @@ fn doctor_reports_abort_watch_without_registering_anything() {
     let abort = &report["abortWatch"];
     assert_eq!(abort["mechanism"], "kglobalaccel", "{report}");
     assert_eq!(abort["available"], false, "the session bus is unreachable");
+    assert!(abort["consumes"].is_null(), "{report}");
     assert!(
         abort["reason"].as_str().is_some_and(|r| !r.is_empty()),
         "{report}"

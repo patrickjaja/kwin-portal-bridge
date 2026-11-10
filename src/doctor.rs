@@ -76,8 +76,7 @@ pub async fn report() -> Value {
         "abortWatch": abort_watch_verdict(
             &bus,
             std::env::var_os("XDG_RUNTIME_DIR").is_some_and(|dir| std::path::Path::new(&dir).is_absolute()),
-        )
-        .to_value(),
+        ),
         // Optional (#306): AT-SPI state; absent = no accessibility support.
         "atspi": atspi,
     })
@@ -124,7 +123,18 @@ struct BusProbe {
 
 /// `abort-watch` needs kglobalaccel running (it is never started for us)
 /// and an absolute `$XDG_RUNTIME_DIR` for the cross-profile holder set.
-fn abort_watch_verdict(bus: &Result<BusProbe, String>, runtime_dir: bool) -> AbortWatchDoctor {
+///
+/// Adds `consumes`: `true` when available (kglobalaccel takes the key from
+/// applications while armed), `null` when unavailable.
+fn abort_watch_verdict(bus: &Result<BusProbe, String>, runtime_dir: bool) -> Value {
+    let base = abort_watch_base(bus, runtime_dir);
+    let available = base.available;
+    let mut value = base.to_value();
+    value["consumes"] = available.then_some(true).into();
+    value
+}
+
+fn abort_watch_base(bus: &Result<BusProbe, String>, runtime_dir: bool) -> AbortWatchDoctor {
     let mechanism = Some(Mechanism::Kglobalaccel);
     match bus {
         Err(error) => AbortWatchDoctor::unavailable(mechanism, error.clone()),
@@ -238,8 +248,8 @@ mod tests {
         };
         // KWin and the portal do not matter (KDE < 6.6, X11).
         assert_eq!(
-            abort_watch_verdict(&with(NameState::Running), true).to_value(),
-            json!({"available": true, "mechanism": "kglobalaccel", "reason": null})
+            abort_watch_verdict(&with(NameState::Running), true),
+            json!({"available": true, "mechanism": "kglobalaccel", "reason": null, "consumes": true})
         );
         for (bus, runtime_dir, reason) in [
             (with(NameState::Activatable), true, KGLOBALACCEL_NAME),
@@ -247,9 +257,10 @@ mod tests {
             (with(NameState::Running), false, "XDG_RUNTIME_DIR"),
             (Err("no bus".to_owned()), true, "no bus"),
         ] {
-            let value = abort_watch_verdict(&bus, runtime_dir).to_value();
+            let value = abort_watch_verdict(&bus, runtime_dir);
             assert_eq!(value["available"], false, "{value}");
             assert_eq!(value["mechanism"], "kglobalaccel", "{value}");
+            assert!(value["consumes"].is_null(), "{value}");
             assert!(
                 value["reason"].as_str().unwrap().contains(reason),
                 "{value}"
