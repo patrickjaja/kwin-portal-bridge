@@ -795,6 +795,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cu-abort-watch"
+version = "0.1.0"
+source = "git+https://github.com/patrickjaja/cu-abort-watch?rev=c8be7212b6e40e582aebc6023d69d20bbedf79dc#c8be7212b6e40e582aebc6023d69d20bbedf79dc"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cu-atspi"
 version = "0.1.0"
 source = "git+https://github.com/patrickjaja/cu-atspi?rev=a390259e9209fda8bb518a8ef253198ba3435ef0#a390259e9209fda8bb518a8ef253198ba3435ef0"
@@ -1994,6 +2004,7 @@ dependencies = [
  "ashpd",
  "base64",
  "clap",
+ "cu-abort-watch",
  "cu-atspi",
  "dbus",
  "freedesktop-desktop-entry",

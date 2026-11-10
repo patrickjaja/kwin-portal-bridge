@@ -1,3 +1,4 @@
+mod abort_watch;
 mod ax;
 mod capture;
 mod cli;
@@ -19,6 +20,8 @@ mod stop_marker;
 mod teach_overlay;
 mod token_store;
 mod util;
+
+use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -52,9 +55,16 @@ fn session_started() -> serde_json::Value {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> ExitCode {
     // Bad usage exits 2 inside `parse`.
     let cli = Cli::parse();
+
+    // Before tracing: the subscriber writes to stdout, which carries the
+    // abort watcher's JSON lines. Needs only kglobalaccel on the session bus,
+    // no KWin 6.6 or portal feature.
+    if matches!(cli.command, Command::AbortWatch) {
+        return abort_watch::run().await;
+    }
 
     // No tracing for the AT-SPI commands, whatever RUST_LOG says: the
     // subscriber writes to stdout, which must stay one JSON value, and
@@ -75,6 +85,7 @@ async fn main() {
             &error,
         ))));
     }
+    ExitCode::SUCCESS
 }
 
 async fn run(cli: Cli) -> Result<()> {
@@ -111,6 +122,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Doctor => {
             print_json(&doctor::report().await)?;
         }
+        Command::AbortWatch => unreachable!("abort-watch is dispatched in main"),
         Command::SessionEnd => {
             print_json(&stop_session_daemon().await?)?;
         }

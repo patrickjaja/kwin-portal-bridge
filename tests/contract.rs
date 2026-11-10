@@ -374,3 +374,29 @@ fn ax_commands_print_one_json_value_even_with_rust_log() {
         .unwrap_or_else(|error| panic!("stdout is not one JSON value ({error}): {output:?}"));
     assert_eq!(value["unavailable"], "no_atspi_bus");
 }
+
+#[test]
+fn doctor_reports_abort_watch_without_registering_anything() {
+    let env = Isolated::new();
+    let report = env.json(&["doctor"]);
+    let abort = &report["abortWatch"];
+    assert_eq!(abort["mechanism"], "kglobalaccel", "{report}");
+    assert_eq!(abort["available"], false, "the session bus is unreachable");
+    assert!(
+        abort["reason"].as_str().is_some_and(|r| !r.is_empty()),
+        "{report}"
+    );
+    assert!(dir_is_empty(&env.runtime));
+}
+
+#[test]
+fn abort_watch_without_a_bus_prints_one_error_line_and_exits_2() {
+    let env = Isolated::new();
+    let output = env.run(&["abort-watch"]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 1, "{stdout}");
+    let line: Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(line["event"], "error", "{stdout}");
+}

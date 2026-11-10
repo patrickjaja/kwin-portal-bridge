@@ -32,6 +32,9 @@ pub enum Command {
     },
     /// Report the bridge, backend, session and grant state as JSON (CLI contract v1).
     Doctor,
+    /// Watch for the user's Escape (kglobalaccel global shortcut) while Computer Use runs;
+    /// JSON lines on stdout, `suspend` / `resume` on stdin (optional part of the CLI contract).
+    AbortWatch,
     /// End the long-lived portal session daemon for this tool-use lock.
     SessionEnd,
     /// Forget the remembered screen-sharing choice so the next session shows the consent dialog again.

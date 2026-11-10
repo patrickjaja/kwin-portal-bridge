@@ -66,8 +66,9 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
+          # dbus-daemon: tests/abort_watch.rs runs a private bus.
           sudo apt-get install -y --no-install-recommends \
-            libxkbcommon-dev libpipewire-0.3-dev
+            libxkbcommon-dev libpipewire-0.3-dev dbus-daemon
 
       - name: cargo build (default features)
         run: cargo build --release --locked
@@ -76,4 +77,6 @@ jobs:
         run: cargo build --release --locked --features mcp
 
       - name: cargo test
+        env:
+          KPB_REQUIRE_DBUS_TESTS: "1"
         run: cargo test --locked --all-features

@@ -2,14 +2,17 @@
 //! (claude-desktop-extra `docs/computer-use-bridge-contract.md`).
 //!
 //! Always exits 0 with one JSON object. Never opens a portal session, never
-//! shows a dialog and never creates files: the backend check is two cheap
+//! shows a dialog and never creates files: the backend check is a few cheap
 //! session-bus name queries under a short timeout, the daemon check one ping
 //! on its socket, the `atspi` key `cu_atspi::doctor` (read only, except that
-//! it restores IsEnabled for a lease whose holders all died).
+//! it restores IsEnabled for a lease whose holders all died). `abortWatch`
+//! (optional contract addition) only asks whether kglobalaccel owns its name: nothing is
+//! registered.
 
 use std::sync::mpsc;
 use std::time::Duration;
 
+use cu_abort_watch::{AbortWatchDoctor, Mechanism};
 use dbus::blocking::Connection;
 use serde_json::{Value, json};
 
@@ -26,6 +29,7 @@ const DAEMON_PING_TIMEOUT: Duration = Duration::from_secs(1);
 const KWIN_NAME: &str = "org.kde.KWin";
 const PORTAL_NAME: &str = "org.freedesktop.portal.Desktop";
 const PORTAL_KDE_NAME: &str = "org.freedesktop.impl.portal.desktop.kde";
+const KGLOBALACCEL_NAME: &str = crate::abort_watch::KGA_NAME;
 
 pub async fn report() -> Value {
     let bus = probe_bus_bounded();
@@ -67,6 +71,13 @@ pub async fn report() -> Value {
         "kwin": name_state(|bus| bus.kwin),
         "portal": name_state(|bus| bus.portal),
         "portal_kde_backend": name_state(|bus| bus.portal_kde),
+        "kglobalaccel": name_state(|bus| bus.kglobalaccel),
+        // Contract v2: can `abort-watch` arm here?
+        "abortWatch": abort_watch_verdict(
+            &bus,
+            std::env::var_os("XDG_RUNTIME_DIR").is_some_and(|dir| std::path::Path::new(&dir).is_absolute()),
+        )
+        .to_value(),
         // Optional (#306): AT-SPI state; absent = no accessibility support.
         "atspi": atspi,
     })
@@ -108,6 +119,26 @@ struct BusProbe {
     kwin: NameState,
     portal: NameState,
     portal_kde: NameState,
+    kglobalaccel: NameState,
+}
+
+/// `abort-watch` needs kglobalaccel running (it is never started for us)
+/// and an absolute `$XDG_RUNTIME_DIR` for the cross-profile holder set.
+fn abort_watch_verdict(bus: &Result<BusProbe, String>, runtime_dir: bool) -> AbortWatchDoctor {
+    let mechanism = Some(Mechanism::Kglobalaccel);
+    match bus {
+        Err(error) => AbortWatchDoctor::unavailable(mechanism, error.clone()),
+        Ok(bus) if bus.kglobalaccel != NameState::Running => AbortWatchDoctor::unavailable(
+            mechanism,
+            format!(
+                "{KGLOBALACCEL_NAME} is not running on the session bus (no KDE global shortcuts)"
+            ),
+        ),
+        Ok(_) if !runtime_dir => {
+            AbortWatchDoctor::unavailable(mechanism, "XDG_RUNTIME_DIR is not set")
+        }
+        Ok(_) => AbortWatchDoctor::available(Mechanism::Kglobalaccel),
+    }
 }
 
 /// Reachable when KWin is on the bus and the portal is running or can be
@@ -180,6 +211,7 @@ fn probe_bus() -> Result<BusProbe, String> {
         kwin: state(KWIN_NAME)?,
         portal: state(PORTAL_NAME)?,
         portal_kde: state(PORTAL_KDE_NAME)?,
+        kglobalaccel: state(KGLOBALACCEL_NAME)?,
     })
 }
 
@@ -192,6 +224,36 @@ mod tests {
             kwin,
             portal,
             portal_kde: NameState::Absent,
+            kglobalaccel: NameState::Absent,
+        }
+    }
+
+    #[test]
+    fn abort_watch_needs_a_running_kglobalaccel_and_a_runtime_dir() {
+        let with = |kglobalaccel| {
+            Ok(BusProbe {
+                kglobalaccel,
+                ..probe(NameState::Absent, NameState::Absent)
+            })
+        };
+        // KWin and the portal do not matter (KDE < 6.6, X11).
+        assert_eq!(
+            abort_watch_verdict(&with(NameState::Running), true).to_value(),
+            json!({"available": true, "mechanism": "kglobalaccel", "reason": null})
+        );
+        for (bus, runtime_dir, reason) in [
+            (with(NameState::Activatable), true, KGLOBALACCEL_NAME),
+            (with(NameState::Absent), true, KGLOBALACCEL_NAME),
+            (with(NameState::Running), false, "XDG_RUNTIME_DIR"),
+            (Err("no bus".to_owned()), true, "no bus"),
+        ] {
+            let value = abort_watch_verdict(&bus, runtime_dir).to_value();
+            assert_eq!(value["available"], false, "{value}");
+            assert_eq!(value["mechanism"], "kglobalaccel", "{value}");
+            assert!(
+                value["reason"].as_str().unwrap().contains(reason),
+                "{value}"
+            );
         }
     }
 

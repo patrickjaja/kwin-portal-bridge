@@ -146,6 +146,123 @@ that claude-desktop-extra uses for every bridge:
 `cargo test` runs `tests/contract.rs` against the built binary in an
 isolated environment.
 
+## `abort-watch`: Escape stops Computer Use (optional contract addition)
+
+`kwin-portal-bridge abort-watch` is a long-running watcher that tells Claude
+Desktop when the user presses Escape. The protocol, signal and parent-death
+handling come from the shared
+[`cu-abort-watch`](https://github.com/patrickjaja/cu-abort-watch) crate:
+
+- stdout, one JSON object per line:
+  `{"event":"ready","mechanism":"kglobalaccel","syntheticSafe":false}` once
+  armed, `{"event":"abort"}` per Escape press,
+  `{"event":"ack","cmd":"suspend"|"resume"}`, `{"event":"error","message":...}`.
+- stdin: `suspend` / `resume`, each acknowledged.
+- Exit 0 on stdin EOF, SIGTERM/SIGINT/SIGHUP or parent death (after removing
+  the shortcut); 1 after an `error` line when kglobalaccel or the session bus
+  goes away, a `resume` fails, or a `suspend` lasts longer than 5 s; 2 when it
+  cannot arm (nothing registered).
+
+It only needs `org.kde.kglobalaccel` on the session bus, so it works on any
+KWin, X11 or Wayland, also below Plasma 6.6 where the rest of the bridge is not
+used. It never starts kglobalaccel (calls are sent without D-Bus auto-start).
+
+### What the user notices while it is armed
+
+kglobalaccel global shortcuts take a key before almost everything else in
+KWin's input chain (the global shortcut filter runs before effects,
+interactive move/resize, popups and the focused application). While Computer
+Use runs with the watcher armed, **every Escape press stops Computer Use and
+does nothing else**: it does not close Overview or other effects, does not
+cancel a window move or resize, does not close popup menus, and does not reach
+any application. The lock screen and Alt+Tab are not affected. The grab is
+released as soon as the watcher exits.
+
+The watcher arms but never fires where global shortcuts are not delivered:
+under a kiosk setup that restricts global shortcuts (`useAllowList`), and
+while a client inhibits shortcuts (for example a remote-desktop or VM viewer
+with keyboard grab). `doctor` only checks that kglobalaccel is running; it
+reports `available` even when Escape is already taken by another shortcut
+(then `abort-watch` refuses with exit 2).
+
+### How it works
+
+D-Bus `org.kde.KGlobalAccel` on `/kglobalaccel`:
+
+- Component `claude-cu-abort` ("Claude: stop Computer Use"), action
+  `_k_session:claude-cu-abort-escape`.
+- Arming: if a previous watcher of this session was killed and left its
+  registration (no live holder), it is removed first. Then
+  `globalShortcutsByKey` for bare Escape with match types Equal (exactly
+  Escape) and Shadows (every sequence that contains Escape, such as `Esc, X`
+  or `Ctrl+X, Esc`). If another component owns one, the watcher refuses with
+  an `error` line naming it and exit 2, and changes nothing. Otherwise
+  `doRegister` and `setShortcutKeys([Escape], SetPresent | NoAutoloading)`,
+  then it listens for the component's `globalShortcutPressed` signal. Before
+  Plasma 6.7 kglobalaccel itself drops a key that another shortcut uses; that
+  is also reported and exits 2.
+- kglobalaccel cannot tell a physical key from one injected through the
+  RemoteDesktop portal or ydotool, so `syntheticSafe` is false: send
+  `suspend` before injecting Escape and `resume` after. `suspend` releases
+  the grab (`setInactive`), so the injected Escape reaches the app. `resume`
+  keeps it released for another 150 ms (`RESUME_SETTLE` in
+  `src/abort_watch.rs`): portal key delivery is asynchronous, and this delay
+  is what keeps a late injected Escape from being grabbed and reported. Then
+  it re-grabs Escape and, before acknowledging, drains the press signals
+  kglobalaccel queued before the re-grab (a ping round trip to its own
+  listening connection); no `abort` is reported in between.
+- A suspension is bounded: a watcher suspended for more than 5 s
+  (`SUSPEND_LIMIT`) fails with exit 1, so a caller that never resumes cannot
+  leave Escape released. Wrap only the Escape key event itself in
+  `suspend` / `resume`, not a long `type` or `holdKey`.
+- The shortcut is per session bus and shared by every Claude profile on that
+  bus (holder set in `$XDG_RUNTIME_DIR/claude-cu-esc/kglobalaccel-<bus id>/`,
+  so two graphical sessions of one user stay separate): the first watcher
+  registers it, the last one removes the action and the component
+  (`setInactive` + `cleanUp`). Each watcher reports the press itself, so one
+  Escape stops Computer Use in every armed profile. A suspension releases
+  Escape for all profiles while it lasts; suspensions are counted
+  (`kglobalaccel-<bus id>-suspended/`), so Escape is grabbed again only when
+  no profile is suspended, and a suspended watcher that died is pruned within
+  about 0.5 s by the others, which grab Escape again.
+- `claude-cu-esc/` must be a real directory owned by the user without
+  group/other access (a looser mode is tightened to 0700; a symlink or another
+  owner refuses to arm with exit 2). The holder directories are created only
+  once kglobalaccel is found, and a failed arm removes them again unless
+  another watcher uses them.
+- A watcher killed with SIGKILL leaves the grab in kglobalaccel's memory
+  until the next watcher in that session arms (it removes the leftover first,
+  even when it then refuses to arm) or the session ends.
+
+### `kglobalshortcutsrc`
+
+The Escape binding itself is never written to disk: kglobalaccel does not
+save `_k_session:` actions. kglobalaccel does save its settings 500 ms after
+registration (and on any other shortcut change while armed), and that write
+includes the component group without any key:
+
+```ini
+[claude-cu-abort]
+_k_friendly_name=Claude: stop Computer Use
+```
+
+A normal exit removes it at once (`cleanUp` writes immediately). After a
+SIGKILL, or when kglobalaccel exits while the watcher is armed, the empty
+group stays in `~/.config/kglobalshortcutsrc` until the next watcher arms and
+exits, or until kglobalaccel's next settings write after a restart (an empty
+component is dropped then). Until then System Settings may list "Claude: stop
+Computer Use" with no shortcut.
+
+`doctor` reports `abortWatch`: available when `org.kde.kglobalaccel` is
+running on the session bus and `XDG_RUNTIME_DIR` is set. It never registers
+anything.
+
+Tests: `tests/abort_watch.rs` drives the binary against a mock kglobalaccel
+(Equal/Shadows matching as in kglobalacceld) on private `dbus-daemon`s (CI
+sets `KPB_REQUIRE_DBUS_TESTS=1`). `scripts/kglobalaccel-smoke/run.sh` runs the
+same flow against the real kglobalaccel daemon library on a private bus and
+checks the real `kglobalshortcutsrc` (see the script header).
+
 ## License
 
 TBD.
