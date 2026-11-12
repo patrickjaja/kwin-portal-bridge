@@ -86,6 +86,8 @@ Things to keep in mind before pointing it at anything important:
 - **Teach overlays.** An `iced` + `layer-shell` overlay for manual
   teaching bubbles, plus a session-edge overlay that indicates an
   active computer-use session without obscuring content.
+- **Computer Use glow and drawn cursor** (`overlay`, cu-overlay protocol
+  1), kept out of every capture through KWin's `excludeFromCapture`.
 - **Standalone MCP server** mode for wiring the bridge directly into
   any MCP-capable client (see caveats above).
 
@@ -263,6 +265,64 @@ Tests: `tests/abort_watch.rs` drives the binary against a mock kglobalaccel
 sets `KPB_REQUIRE_DBUS_TESTS=1`). `scripts/kglobalaccel-smoke/run.sh` runs the
 same flow against the real kglobalaccel daemon library on a private bus and
 checks the real `kglobalshortcutsrc` (see the script header).
+
+## `overlay`: glow and drawn cursor (optional contract addition)
+
+`kwin-portal-bridge overlay` draws Claude's Computer Use glow and drawn cursor
+on a click-through wlr-layer-shell surface on the overlay layer (namespace
+`claude-cu-overlay`, exclusive zone -1, no keyboard interactivity, empty input
+region). The renderer, the JSON-lines protocol (protocol 1: commands on stdin,
+events on stdout) and the exit codes are the shared
+[cu-overlay](https://github.com/patrickjaja/cu-overlay) crate's; the same
+subcommand exists in wlroots-bridge. It needs no portal session and no daemon,
+and it runs before the bridge's tokio runtime and logging exist: stdout
+carries protocol lines only, whatever `RUST_LOG` says, diagnostics go to
+stderr. Exit 0 on stdin EOF or the parent's death (`CLAUDE_CU_PARENT_PID`,
+else the direct parent), 1 when the display or stdout is lost, 2 without
+layer-shell or when `show` names an unknown output.
+
+The overlay never shows up in this bridge's screenshots or the portal's
+ScreenCast stream. KWin shows the layer surface to scripts with an empty
+caption, the client executable's basename as `resourceClass` /
+`resourceName`, the overlay's own `pid` and `layer` 9; the namespace is not
+visible to scripts. For as long as the process lives it keeps a KWin script
+loaded (plugin `kwin-portal-bridge-cu-overlay-<pid>-<start time>`) that sets
+`excludeFromCapture` on every existing and newly added window whose `pid` is
+the overlay's and whose `layer` is 9 or whose class is the bridge's
+executable name, and it unloads the script on exit. A run killed by a signal
+cannot unload it; the next `overlay` start unloads the scripts whose process
+is gone (records in `$XDG_RUNTIME_DIR/kwin-portal-bridge/cu-overlay/`). Without
+KWin scripting the overlay still runs and leaves one stderr line. The
+`windows`-based lazy exclusion and the window filters of `frontmost-app`,
+`app-under-point` and the occlusion checks already treat every window of the
+bridge's executable as the bridge's own, so the overlay is never taken for an
+application window there.
+
+`KWIN_PORTAL_BRIDGE_SESSION_OVERLAY=0` in the environment of `session-start`
+(the daemon it spawns inherits it) leaves out the daemon's own iced session
+glow, for a caller that draws its indicator through `overlay` instead.
+`set-overlay-display` then still succeeds with the same output, as a no-op.
+The teach overlay is not affected. Unset or any other value: the session glow
+runs as before. A daemon already running keeps the setting it started with.
+
+`doctor` reports `capabilities` (same keys and meaning as wlroots-bridge,
+from one Wayland registry round trip bounded to 1 s; all false without a
+compositor):
+
+```json
+"capabilities": {
+  "overlay": true,
+  "overlay_alpha_modifier": true,
+  "overlay_fractional_scale": true,
+  "session_overlay_opt_out": true
+}
+```
+
+`overlay`: `zwlr_layer_shell_v1` is advertised. `overlay_alpha_modifier`: also
+`wp_alpha_modifier_v1` (fades, glow pulse, capture hide without redrawing).
+`overlay_fractional_scale`: also `wp_fractional_scale_manager_v1` and
+`wp_viewporter` (crisp at fractional scales). `session_overlay_opt_out`: this
+build honors `KWIN_PORTAL_BRIDGE_SESSION_OVERLAY=0`.
 
 ## License
 
