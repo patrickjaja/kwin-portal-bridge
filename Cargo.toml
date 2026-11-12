@@ -1,12 +1,14 @@
 [package]
 name = "kwin-portal-bridge"
-version = "0.2.8"
+version = "0.2.9"
 edition = "2024"
 
 [dependencies]
 cu-atspi = { git = "https://github.com/patrickjaja/cu-atspi", rev = "a390259e9209fda8bb518a8ef253198ba3435ef0" }
 # Shared runner for the `abort-watch` subcommand, pinned by rev like cu-atspi.
 cu-abort-watch = { git = "https://github.com/patrickjaja/cu-abort-watch", rev = "c8be7212b6e40e582aebc6023d69d20bbedf79dc" }
+# Shared layer-shell renderer for the `overlay` subcommand (glow and drawn cursor).
+cu-overlay = { git = "https://github.com/patrickjaja/cu-overlay", rev = "8fa7f6822bc2362f1a6b44a211da24d6e487045d" }
 anyhow = "1.0.103"
 ashpd = "0.13.12"
 base64 = "0.22.1"
@@ -26,6 +28,9 @@ schemars = { version = "1.2.1", default-features = false, optional = true }
 tempfile = { version = "3.27.0", default-features = false}
 tokio = { version = "1.52.3", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "time"] , default-features = false}
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] , default-features = false}
+# doctor's registry probe for the overlay capabilities (already in the tree
+# through cu-overlay and iced).
+wayland-client = { version = "0.31.14", default-features = false }
 wl-clipboard-rs = { version = "0.9.3", default-features = false}
 rmcp = { version = "2.2.0", features = ["schemars", "transport-io", "server", "macros"] , default-features = false, optional = true }
 

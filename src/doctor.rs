@@ -7,7 +7,8 @@
 //! on its socket, the `atspi` key `cu_atspi::doctor` (read only, except that
 //! it restores IsEnabled for a lease whose holders all died). `abortWatch`
 //! (optional contract addition) only asks whether kglobalaccel owns its name: nothing is
-//! registered.
+//! registered. `capabilities` (additive) comes from one Wayland registry
+//! round trip on its own thread, bounded like the bus probe.
 
 use std::sync::mpsc;
 use std::time::Duration;
@@ -23,6 +24,9 @@ use crate::token_store::TokenStore;
 const BUS_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 /// Per-call D-Bus timeout inside the probe.
 const BUS_CALL_TIMEOUT: Duration = Duration::from_millis(1000);
+/// Budget for the Wayland registry probe (connect + one round trip), counted
+/// from the start of `doctor`: it runs beside the other probes.
+const WAYLAND_PROBE_TIMEOUT: Duration = Duration::from_millis(1000);
 /// How long the session daemon gets to answer a ping.
 const DAEMON_PING_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -32,6 +36,8 @@ const PORTAL_KDE_NAME: &str = "org.freedesktop.impl.portal.desktop.kde";
 const KGLOBALACCEL_NAME: &str = crate::abort_watch::KGA_NAME;
 
 pub async fn report() -> Value {
+    let wayland_started = std::time::Instant::now();
+    let wayland = spawn_wayland_probe();
     let bus = probe_bus_bounded();
     let (backend_reachable, backend_error) = match &bus {
         Ok(bus) => backend_verdict(bus),
@@ -79,7 +85,100 @@ pub async fn report() -> Value {
         ),
         // Optional (#306): AT-SPI state; absent = no accessibility support.
         "atspi": atspi,
+        // Additive: what the `overlay` subcommand can do here, and that
+        // KWIN_PORTAL_BRIDGE_SESSION_OVERLAY=0 is honored.
+        "capabilities": capabilities(
+            wayland
+                .recv_timeout(WAYLAND_PROBE_TIMEOUT.saturating_sub(wayland_started.elapsed()))
+                .ok()
+                .flatten()
+                .as_ref()
+        ),
     })
+}
+
+/// The overlay-relevant globals the compositor advertises.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct OverlayGlobals {
+    layer_shell: bool,
+    alpha_modifier: bool,
+    fractional_scale: bool,
+    viewporter: bool,
+}
+
+impl OverlayGlobals {
+    fn from_interfaces<'a>(interfaces: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut globals = Self::default();
+        for interface in interfaces {
+            match interface {
+                "zwlr_layer_shell_v1" => globals.layer_shell = true,
+                "wp_alpha_modifier_v1" => globals.alpha_modifier = true,
+                "wp_fractional_scale_manager_v1" => globals.fractional_scale = true,
+                "wp_viewporter" => globals.viewporter = true,
+                _ => {}
+            }
+        }
+        globals
+    }
+}
+
+/// `capabilities`, the same keys and meaning as wlroots-bridge's: `overlay`
+/// = zwlr_layer_shell_v1 advertised; `overlay_alpha_modifier` = also
+/// wp_alpha_modifier_v1 (fades, pulse, capture hide); `overlay_fractional_scale`
+/// = also wp_fractional_scale_manager_v1 and wp_viewporter. All false when
+/// the compositor did not answer. `session_overlay_opt_out`: this build
+/// honors KWIN_PORTAL_BRIDGE_SESSION_OVERLAY=0.
+fn capabilities(globals: Option<&OverlayGlobals>) -> Value {
+    let g = globals.copied().unwrap_or_default();
+    json!({
+        "overlay": g.layer_shell,
+        "overlay_alpha_modifier": g.layer_shell && g.alpha_modifier,
+        "overlay_fractional_scale": g.layer_shell && g.fractional_scale && g.viewporter,
+        "session_overlay_opt_out": true,
+    })
+}
+
+/// Start the registry probe on its own thread (a stuck compositor must not
+/// hold up `doctor`); the receiver gets `None` when there is no compositor.
+fn spawn_wayland_probe() -> mpsc::Receiver<Option<OverlayGlobals>> {
+    let (sender, receiver) = mpsc::channel();
+    let _ = std::thread::Builder::new()
+        .name("doctor-wayland-probe".to_owned())
+        .spawn(move || {
+            let _ = sender.send(probe_wayland());
+        });
+    receiver
+}
+
+fn probe_wayland() -> Option<OverlayGlobals> {
+    use wayland_client::globals::{GlobalListContents, registry_queue_init};
+    use wayland_client::protocol::wl_registry;
+    use wayland_client::{Connection, Dispatch, QueueHandle};
+
+    struct Probe;
+    impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for Probe {
+        fn event(
+            _: &mut Self,
+            _: &wl_registry::WlRegistry,
+            _: wl_registry::Event,
+            _: &GlobalListContents,
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    // Only a configured display: never guess `wayland-0`.
+    if std::env::var_os("WAYLAND_DISPLAY").is_none_or(|value| value.is_empty())
+        && std::env::var_os("WAYLAND_SOCKET").is_none()
+    {
+        return None;
+    }
+    let conn = Connection::connect_to_env().ok()?;
+    let (globals, _queue) = registry_queue_init::<Probe>(&conn).ok()?;
+    Some(globals.contents().with_list(|list| {
+        OverlayGlobals::from_interfaces(list.iter().map(|global| global.interface.as_str()))
+    }))
 }
 
 /// The bridge serves this session when it is KDE Plasma on Wayland.
@@ -266,6 +365,52 @@ mod tests {
                 "{value}"
             );
         }
+    }
+
+    #[test]
+    fn capabilities_json() {
+        let all_false = json!({
+            "overlay": false,
+            "overlay_alpha_modifier": false,
+            "overlay_fractional_scale": false,
+            "session_overlay_opt_out": true,
+        });
+        // No compositor, or one without layer-shell.
+        assert_eq!(capabilities(None), all_false);
+        let no_layer_shell = OverlayGlobals::from_interfaces([
+            "wl_compositor",
+            "wp_alpha_modifier_v1",
+            "wp_fractional_scale_manager_v1",
+            "wp_viewporter",
+        ]);
+        assert_eq!(capabilities(Some(&no_layer_shell)), all_false);
+        let full = OverlayGlobals {
+            layer_shell: true,
+            ..no_layer_shell
+        };
+        assert_eq!(
+            capabilities(Some(&full)),
+            json!({
+                "overlay": true,
+                "overlay_alpha_modifier": true,
+                "overlay_fractional_scale": true,
+                "session_overlay_opt_out": true,
+            })
+        );
+        // Fractional scale needs the viewporter too.
+        let bare = OverlayGlobals::from_interfaces([
+            "zwlr_layer_shell_v1",
+            "wp_fractional_scale_manager_v1",
+        ]);
+        assert_eq!(
+            capabilities(Some(&bare)),
+            json!({
+                "overlay": true,
+                "overlay_alpha_modifier": false,
+                "overlay_fractional_scale": false,
+                "session_overlay_opt_out": true,
+            })
+        );
     }
 
     #[test]

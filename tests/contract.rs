@@ -401,3 +401,60 @@ fn abort_watch_without_a_bus_prints_one_error_line_and_exits_2() {
     let line: Value = serde_json::from_str(lines[0]).unwrap();
     assert_eq!(line["event"], "error", "{stdout}");
 }
+
+#[test]
+fn doctor_reports_overlay_capabilities_without_a_compositor() {
+    let env = Isolated::new();
+    let report = env.json(&["doctor"]);
+    assert_eq!(
+        report["capabilities"],
+        serde_json::json!({
+            "overlay": false,
+            "overlay_alpha_modifier": false,
+            "overlay_fractional_scale": false,
+            "session_overlay_opt_out": true
+        }),
+        "{report}"
+    );
+    // A display that does not exist: still all false, still exit 0.
+    let output = Command::new(BIN)
+        .arg("doctor")
+        .env_clear()
+        .env("HOME", &env.home)
+        .env("XDG_STATE_HOME", &env.state)
+        .env("XDG_RUNTIME_DIR", &env.runtime)
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
+        .env("WAYLAND_DISPLAY", "wayland-nonexistent")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["capabilities"]["overlay"], false, "{report}");
+}
+
+#[test]
+fn overlay_without_a_display_prints_one_fatal_error_line_and_exits_2() {
+    let env = Isolated::new();
+    let output = Command::new(BIN)
+        .arg("overlay")
+        .env_clear()
+        .env("HOME", &env.home)
+        .env("XDG_STATE_HOME", &env.state)
+        .env("XDG_RUNTIME_DIR", &env.runtime)
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
+        // Nothing but protocol lines on stdout, whatever RUST_LOG says.
+        .env("RUST_LOG", "trace")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 1, "{stdout}");
+    let line: Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(line["event"], "error", "{stdout}");
+    assert_eq!(line["fatal"], true, "{stdout}");
+    // The capture-exclusion helper left no record behind.
+    let records = env.runtime.join("kwin-portal-bridge/cu-overlay");
+    assert!(!records.exists() || dir_is_empty(&records));
+}

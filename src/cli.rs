@@ -35,6 +35,15 @@ pub enum Command {
     /// Watch for the user's Escape (kglobalaccel global shortcut) while Computer Use runs;
     /// JSON lines on stdout, `suspend` / `resume` on stdin (optional part of the CLI contract).
     AbortWatch,
+    /// Draw Claude's Computer Use glow and drawn cursor (cu-overlay protocol 1): commands
+    /// as JSON lines on stdin, events on stdout (optional part of the CLI contract).
+    ///
+    /// A click-through wlr-layer-shell surface (namespace `claude-cu-overlay`) kept out of
+    /// screen captures through KWin's excludeFromCapture. stdout carries protocol lines
+    /// only; diagnostics go to stderr. No session or daemon needed. Exit 0 on stdin EOF or
+    /// the parent's death (CLAUDE_CU_PARENT_PID, else the direct parent), 1 when the display
+    /// or stdout is lost, 2 without layer-shell or when `show` names an unknown output.
+    Overlay,
     /// End the long-lived portal session daemon for this tool-use lock.
     SessionEnd,
     /// Forget the remembered screen-sharing choice so the next session shows the consent dialog again.

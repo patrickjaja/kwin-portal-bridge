@@ -13,6 +13,7 @@ mod kwin;
 #[cfg(feature = "mcp")]
 mod mcp;
 mod model;
+mod overlay;
 mod portal;
 mod session_overlay;
 mod settle;
@@ -54,11 +55,30 @@ fn session_started() -> serde_json::Value {
     serde_json::json!({ "ok": true, "session": "daemon" })
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     // Bad usage exits 2 inside `parse`.
     let cli = Cli::parse();
 
+    // overlay: before tracing and before any tokio runtime. cu-overlay owns
+    // stdin / stdout (protocol lines only), the parent-death watch and the
+    // exit code, and blocks on its own Wayland connection.
+    if matches!(cli.command, Command::Overlay) {
+        return overlay::run();
+    }
+
+    match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime.block_on(async_main(cli)),
+        Err(error) => {
+            eprintln!("Error: failed to start the tokio runtime: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn async_main(cli: Cli) -> ExitCode {
     // Before tracing: the subscriber writes to stdout, which carries the
     // abort watcher's JSON lines. Needs only kglobalaccel on the session bus,
     // no KWin 6.6 or portal feature.
@@ -123,6 +143,7 @@ async fn run(cli: Cli) -> Result<()> {
             print_json(&doctor::report().await)?;
         }
         Command::AbortWatch => unreachable!("abort-watch is dispatched in main"),
+        Command::Overlay => unreachable!("overlay is dispatched in main"),
         Command::SessionEnd => {
             print_json(&stop_session_daemon().await?)?;
         }

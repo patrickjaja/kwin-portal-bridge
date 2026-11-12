@@ -35,8 +35,9 @@ fn runtime_base_from(xdg_runtime_dir: Option<OsString>) -> PathBuf {
 }
 
 /// Lowercased identifiers that mark a window as belonging to this bridge
-/// process — including its teach and session overlays, which inherit the
-/// binary's `resourceClass` / `resourceName`. Includes both the cargo
+/// process — including its teach and session overlays and the `overlay`
+/// subcommand's layer surface, which inherit the binary's `resourceClass` /
+/// `resourceName` (KWin names a Wayland client by its executable's basename). Includes both the cargo
 /// package name (compile-time) and the running executable's basename
 /// (runtime), since the binary can be renamed at install time.
 pub fn bridge_overlay_names() -> &'static [String] {
