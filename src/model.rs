@@ -38,6 +38,7 @@ pub struct WindowInfo {
     pub id: String,
     pub title: String,
     pub geometry: Rect,
+    #[serde(default, deserialize_with = "lenient_pid")]
     pub pid: Option<u32>,
     pub desktop_file_name: Option<String>,
     pub resource_class: Option<String>,
@@ -321,6 +322,19 @@ pub struct PortalActionResult {
 #[derive(Debug, Clone)]
 pub struct CapturedFrame {
     pub frame: lamco_pipewire::VideoFrame,
+}
+
+/// A window's pid as KWin scripts report it. KWin's own windows (decoration
+/// tooltips, internal popups) answer -1; anything that is not a positive
+/// 32-bit number is no pid, so one such window never fails a whole listing.
+pub fn lenient_pid<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<i64>::deserialize(deserializer)?;
+    Ok(value
+        .filter(|pid| *pid > 0)
+        .and_then(|pid| u32::try_from(pid).ok()))
 }
 
 #[cfg(test)]

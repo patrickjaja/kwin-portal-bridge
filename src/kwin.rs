@@ -180,7 +180,7 @@ pub struct AxWindow {
     pub id: String,
     #[serde(default)]
     pub title: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::model::lenient_pid")]
     pub pid: Option<u32>,
     #[serde(default)]
     pub desktop_file_name: Option<String>,
@@ -518,7 +518,7 @@ try {
         id: String(window.internalId),
         title: window.caption || "",
         geometry: bridgeRect(window.frameGeometry),
-        pid: window.pid || null,
+        pid: window.pid > 0 ? window.pid : null,
         desktop_file_name: window.desktopFileName || null,
         resource_class: window.resourceClass || null,
         resource_name: window.resourceName || null,
@@ -579,7 +579,7 @@ try {
             window: {
                 id: String(target.internalId),
                 title: target.caption || "",
-                pid: target.pid || null,
+                pid: target.pid > 0 ? target.pid : null,
                 desktop_file_name: target.desktopFileName || null,
                 resource_class: target.resourceClass || null,
                 output: target.output ? target.output.name : null,
@@ -722,6 +722,14 @@ mod tests {
         let window = lookup.window.unwrap();
         assert_eq!(window.client_geometry.unwrap().y, 80);
         assert_eq!(window.x11, Some(false));
+
+        // KWin's own windows (decoration tooltips) report pid -1.
+        let internal: AxWindowLookup = serde_json::from_str(
+            r#"{"found":true,"window":{"id":"t","pid":-1,
+                "frame_geometry":{"x":0,"y":0,"width":10,"height":10}}}"#,
+        )
+        .unwrap();
+        assert_eq!(internal.window.unwrap().pid, None);
 
         let missing: AxWindowLookup = serde_json::from_str(r#"{"found":false}"#).unwrap();
         assert!(!missing.found && missing.window.is_none());
