@@ -7,57 +7,48 @@
 //! dialog and work whether or not a daemon is running. The stopped-by-user
 //! marker does not apply to them.
 
-use std::io::Read;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
-use cu_atspi::{FindRequest, Rect as AxRect, WindowHint};
+use anyhow::Result;
+use cu_atspi::cli::AxFindFlags;
+use cu_atspi::{AtspiDoctor, Rect as AxRect, WindowHint};
 use serde_json::{Value, json};
 
 use crate::kwin::{AxWindow, KWinBackend};
 use crate::model::Rect;
 
-/// `ax-find` filters, straight from the command line.
-#[derive(Debug, Default)]
-pub struct FindOptions {
-    pub role: Option<String>,
-    pub title_contains: Option<String>,
-    pub all: bool,
-    pub include_hidden: bool,
-    pub max_nodes: Option<usize>,
-    pub max_depth: Option<u32>,
-}
-
 /// Budget for `doctor.atspi`, so `doctor` stays well inside the launcher's
 /// 5 s kill (the crate's own deadline is 5 s).
 const DOCTOR_ATSPI_BUDGET: Duration = Duration::from_secs(3);
 
-/// `doctor.atspi`. Never fails: the crate reports its own errors in `error`.
+/// `doctor.atspi`. Never fails: the crate reports its own errors in `error`;
+/// the timeout fallback still carries the feature list.
 pub async fn doctor_atspi() -> Value {
-    match tokio::time::timeout(DOCTOR_ATSPI_BUDGET, cu_atspi::doctor()).await {
-        Ok(report) => serde_json::to_value(report)
-            .unwrap_or_else(|error| json!({ "bus": false, "error": error.to_string() })),
-        Err(_) => json!({
-            "bus": false,
-            "error": format!(
+    let report = match tokio::time::timeout(DOCTOR_ATSPI_BUDGET, cu_atspi::doctor()).await {
+        Ok(report) => report,
+        Err(_) => AtspiDoctor {
+            error: Some(format!(
                 "accessibility probe timed out after {} s",
                 DOCTOR_ATSPI_BUDGET.as_secs()
-            ),
-        }),
-    }
+            )),
+            ..AtspiDoctor::default()
+        },
+    };
+    serde_json::to_value(report)
+        .unwrap_or_else(|error| json!({ "bus": false, "error": error.to_string() }))
 }
 
 /// `ax-find`: resolve the window through KWin, then walk its AT-SPI tree.
-pub async fn find(kwin: &KWinBackend, window_id: &str, opts: FindOptions) -> Result<Value> {
-    find_in(kwin.ax_window(window_id)?, window_id, opts).await
+pub async fn find(kwin: &KWinBackend, window_id: &str, flags: &AxFindFlags) -> Result<Value> {
+    find_in(kwin.ax_window(window_id)?, window_id, flags).await
 }
 
 /// `ax-find` once KWin answered the lookup (`None`: no such window).
-async fn find_in(window: Option<AxWindow>, window_id: &str, opts: FindOptions) -> Result<Value> {
+async fn find_in(window: Option<AxWindow>, window_id: &str, flags: &AxFindFlags) -> Result<Value> {
     let Some(window) = window else {
         return Ok(window_not_found(window_id));
     };
-    let request = find_request(&window, opts);
+    let request = flags.request(window_hint(&window));
     Ok(serde_json::to_value(cu_atspi::find(&request).await?)?)
 }
 
@@ -66,18 +57,6 @@ fn window_not_found(window_id: &str) -> Value {
         "unavailable": "window_not_found",
         "hint": format!("KWin has no window with id {window_id}; list the windows again."),
     })
-}
-
-pub fn find_request(window: &AxWindow, opts: FindOptions) -> FindRequest {
-    FindRequest {
-        window: window_hint(window),
-        role: opts.role,
-        title_contains: opts.title_contains,
-        all: opts.all,
-        include_hidden: opts.include_hidden,
-        max_nodes: opts.max_nodes,
-        max_depth: opts.max_depth,
-    }
 }
 
 /// KWin window -> crate hint. KWin geometry is global logical px, the space
@@ -111,24 +90,6 @@ fn non_empty(value: Option<&str>) -> Option<String> {
     value
         .filter(|value| !value.trim().is_empty())
         .map(str::to_owned)
-}
-
-/// Why `ax-action --action set-text` could not take its text.
-#[derive(Debug)]
-pub struct StdinNotUtf8;
-
-/// The whole of stdin as the text for `set-text`: UTF-8, nothing trimmed.
-/// The text is never logged or echoed.
-pub fn read_stdin_text() -> Result<std::result::Result<String, StdinNotUtf8>> {
-    let mut bytes = Vec::new();
-    std::io::stdin()
-        .read_to_end(&mut bytes)
-        .context("failed to read the text from stdin")?;
-    Ok(decode_text(bytes))
-}
-
-fn decode_text(bytes: Vec<u8>) -> std::result::Result<String, StdinNotUtf8> {
-    String::from_utf8(bytes).map_err(|_| StdinNotUtf8)
 }
 
 #[cfg(test)]
@@ -201,17 +162,16 @@ mod tests {
     fn find_request_carries_the_filters() {
         let window =
             kwin_window(r#"{"id":"w","frame_geometry":{"x":0,"y":0,"width":10,"height":10}}"#);
-        let request = find_request(
-            &window,
-            FindOptions {
-                role: Some("AXButton".into()),
-                title_contains: Some("Save".into()),
-                all: true,
-                include_hidden: true,
-                max_nodes: Some(50),
-                max_depth: Some(4),
-            },
-        );
+        let flags = AxFindFlags {
+            role: Some("AXButton".into()),
+            title_contains: Some("Save".into()),
+            all: true,
+            include_hidden: true,
+            max_nodes: Some(50),
+            max_depth: Some(4),
+            ..AxFindFlags::default()
+        };
+        let request = flags.request(window_hint(&window));
         assert_eq!(request.role.as_deref(), Some("AXButton"));
         assert_eq!(request.title_contains.as_deref(), Some("Save"));
         assert!(request.all && request.include_hidden);
@@ -221,7 +181,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_for_an_unknown_window_is_unavailable_without_any_bus() {
-        let value = find_in(None, "{gone}", FindOptions::default())
+        let value = find_in(None, "{gone}", &AxFindFlags::default())
             .await
             .unwrap();
         assert_eq!(value["unavailable"], "window_not_found");
@@ -232,13 +192,5 @@ mod tests {
         let value = window_not_found("{nope}");
         assert_eq!(value["unavailable"], "window_not_found");
         assert!(value["hint"].as_str().unwrap().contains("{nope}"));
-    }
-
-    #[test]
-    fn stdin_text_is_taken_verbatim() {
-        let text = "  line one\nzeile zwei \u{00e4}\u{1f600}\n\n";
-        assert_eq!(decode_text(text.as_bytes().to_vec()).unwrap(), text);
-        assert_eq!(decode_text(Vec::new()).unwrap(), "");
-        assert!(decode_text(vec![0xff, 0xfe]).is_err());
     }
 }

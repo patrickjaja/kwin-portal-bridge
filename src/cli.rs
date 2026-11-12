@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -9,15 +9,6 @@ use clap::{Parser, Subcommand, ValueEnum};
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
-}
-
-/// `ax-action --action` values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum AxActionKind {
-    Click,
-    Focus,
-    /// Text comes from stdin (UTF-8, whole stdin, no trimming).
-    SetText,
 }
 
 #[derive(Debug, Subcommand)]
@@ -278,28 +269,16 @@ pub enum Command {
     AxFind {
         #[arg(long)]
         window: String,
-        #[arg(long)]
-        role: Option<String>,
-        #[arg(long)]
-        title_contains: Option<String>,
-        #[arg(long)]
-        all: bool,
-        #[arg(long)]
-        include_hidden: bool,
-        #[arg(long)]
-        max_nodes: Option<usize>,
-        #[arg(long)]
-        max_depth: Option<u32>,
+        #[command(flatten)]
+        ax: cu_atspi::cli::AxFindFlags,
     },
-    /// Act on an element returned by `ax-find` (click, focus, set-text via stdin).
+    /// Act on an element returned by `ax-find` (click, focus, set-text via stdin, ensure-*, scroll-to, set-value).
     AxAction {
-        #[arg(long)]
-        scope: String,
-        #[arg(long = "ref")]
-        element_ref: String,
-        #[arg(long, value_enum)]
-        action: AxActionKind,
+        #[command(flatten)]
+        ax: cu_atspi::cli::AxActionFlags,
     },
+    /// Print the accessibility features of this build as JSON (opens no bus).
+    AxFeatures,
 }
 
 #[cfg(test)]
@@ -400,6 +379,12 @@ mod tests {
         ));
     }
 
+    fn parse_err(argv: &[&str]) -> clap::Error {
+        let mut full = vec!["kwin-portal-bridge"];
+        full.extend_from_slice(argv);
+        Cli::try_parse_from(full).unwrap_err()
+    }
+
     #[test]
     fn ax_commands_parse() {
         assert!(matches!(
@@ -410,15 +395,8 @@ mod tests {
             parse(&["ax-restore", "--holder-pid", "1"]),
             Command::AxRestore { holder_pid: 1 }
         ));
-        let Command::AxFind {
-            window,
-            role,
-            title_contains,
-            all,
-            include_hidden,
-            max_nodes,
-            max_depth,
-        } = parse(&[
+        assert!(matches!(parse(&["ax-features"]), Command::AxFeatures));
+        let Command::AxFind { window, ax } = parse(&[
             "ax-find",
             "--window",
             "{3f2a-uuid}",
@@ -432,35 +410,61 @@ mod tests {
             "500",
             "--max-depth",
             "10",
-        ])
-        else {
+        ]) else {
             panic!("expected ax-find");
         };
         assert_eq!(window, "{3f2a-uuid}");
-        assert_eq!(role.as_deref(), Some("AXButton"));
-        assert_eq!(title_contains.as_deref(), Some("Save"));
-        assert!(all && include_hidden);
-        assert_eq!((max_nodes, max_depth), (Some(500), Some(10)));
+        assert_eq!(ax.role.as_deref(), Some("AXButton"));
+        assert_eq!(ax.title_contains.as_deref(), Some("Save"));
+        assert!(ax.all && ax.include_hidden);
+        assert_eq!((ax.max_nodes, ax.max_depth), (Some(500), Some(10)));
 
-        let Command::AxFind {
-            role,
-            all,
-            max_nodes,
-            ..
-        } = parse(&["ax-find", "--window", "w"])
-        else {
+        let Command::AxFind { ax, .. } = parse(&["ax-find", "--window", "w"]) else {
             panic!("expected ax-find");
         };
-        assert!(role.is_none() && !all && max_nodes.is_none());
+        assert!(ax.role.is_none() && !ax.all && ax.max_nodes.is_none());
+    }
+
+    #[test]
+    fn ax_find_takes_the_crate_flags() {
+        let Command::AxFind { ax, .. } = parse(&[
+            "ax-find",
+            "--window",
+            "w",
+            "--window-ref",
+            ":1.4/r",
+            "--deadline-ms",
+            "300",
+            "--root-ref",
+            ":1.4/e",
+            "--scope",
+            "v1|:1.4|/w|7",
+            "--skeleton",
+        ]) else {
+            panic!("expected ax-find");
+        };
+        assert_eq!(ax.window_ref.as_deref(), Some(":1.4/r"));
+        assert_eq!(ax.deadline_ms, Some(300));
+        assert!(ax.skeleton);
+        for argv in [
+            &["ax-find", "--window", "w", "--root-ref", "r"][..],
+            &["ax-find", "--window", "w", "--scope", "s"][..],
+            &[
+                "ax-find",
+                "--window",
+                "w",
+                "--skeleton",
+                "--role",
+                "AXButton",
+            ][..],
+        ] {
+            assert_eq!(parse_err(argv).exit_code(), 2, "{argv:?}");
+        }
     }
 
     #[test]
     fn ax_action_takes_no_text_on_argv() {
-        let Command::AxAction {
-            scope,
-            element_ref,
-            action,
-        } = parse(&[
+        let Command::AxAction { ax } = parse(&[
             "ax-action",
             "--scope",
             "v1|:1.42|/org/a11y/atspi/accessible/1|4242",
@@ -468,19 +472,42 @@ mod tests {
             ":1.42/org/a11y/atspi/accessible/5",
             "--action",
             "set-text",
-        ])
-        else {
+        ]) else {
             panic!("expected ax-action");
         };
-        assert_eq!(scope, "v1|:1.42|/org/a11y/atspi/accessible/1|4242");
-        assert_eq!(element_ref, ":1.42/org/a11y/atspi/accessible/5");
-        assert_eq!(action, AxActionKind::SetText);
-        for kind in ["click", "focus"] {
+        assert_eq!(ax.scope, "v1|:1.42|/org/a11y/atspi/accessible/1|4242");
+        assert_eq!(ax.element_ref, ":1.42/org/a11y/atspi/accessible/5");
+        let request = ax.request(false, " hi\n".as_bytes()).unwrap();
+        assert_eq!(request.action, cu_atspi::Action::SetText(" hi\n".into()));
+        for kind in [
+            "click",
+            "focus",
+            "ensure-checked",
+            "ensure-unchecked",
+            "ensure-expanded",
+            "ensure-collapsed",
+            "ensure-selected",
+            "scroll-to",
+            "set-value",
+        ] {
             assert!(matches!(
                 parse(&["ax-action", "--scope", "s", "--ref", "r", "--action", kind]),
                 Command::AxAction { .. }
             ));
         }
+        // set-value needs its number through --expect-json.
+        let Command::AxAction { ax } = parse(&[
+            "ax-action",
+            "--scope",
+            "s",
+            "--ref",
+            "r",
+            "--action",
+            "set-value",
+        ]) else {
+            panic!("expected ax-action");
+        };
+        assert!(ax.request(false, &b"42"[..]).unwrap_err().is_usage());
         // The text never travels on argv.
         for argv in [
             &[
@@ -507,11 +534,21 @@ mod tests {
             &["ax-enable"][..],
             &["ax-find"][..],
         ] {
-            let mut full = vec!["kwin-portal-bridge"];
-            full.extend_from_slice(argv);
-            let error = Cli::try_parse_from(full).unwrap_err();
-            assert_eq!(error.exit_code(), 2, "{argv:?}");
+            assert_eq!(parse_err(argv).exit_code(), 2, "{argv:?}");
         }
+    }
+
+    #[test]
+    fn ax_features_list_is_the_crates() {
+        let value: serde_json::Value = serde_json::from_str(&cu_atspi::features_json()).unwrap();
+        let listed: Vec<&str> = value["ax_features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|feature| feature.as_str().unwrap())
+            .collect();
+        assert_eq!(listed, cu_atspi::features());
+        assert_eq!(listed.len(), 13);
     }
 
     #[test]

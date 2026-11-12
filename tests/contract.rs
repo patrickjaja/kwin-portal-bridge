@@ -303,6 +303,28 @@ fn doctor_has_an_atspi_key_without_a_bus() {
     let atspi = &doctor["atspi"];
     assert_eq!(atspi["bus"], Value::Bool(false), "{atspi}");
     assert!(atspi["error"].is_string(), "{atspi}");
+    assert_eq!(
+        atspi["features"].as_array().map(Vec::len),
+        Some(13),
+        "{atspi}"
+    );
+}
+
+#[test]
+fn ax_features_prints_the_list_without_any_bus() {
+    let env = Isolated::new();
+    let output = Command::new(BIN)
+        .arg("ax-features")
+        .env_clear()
+        .env("HOME", &env.home)
+        .env("XDG_RUNTIME_DIR", &env.runtime)
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["ax_features"].as_array().map(Vec::len), Some(13));
+    assert!(output.stderr.is_empty(), "{output:?}");
 }
 
 #[test]

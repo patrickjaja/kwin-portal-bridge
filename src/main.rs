@@ -29,7 +29,7 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use crate::capture::CaptureBackend;
-use crate::cli::{AxActionKind, Cli, Command};
+use crate::cli::{Cli, Command};
 use crate::daemon::{
     forget_session, open_session_daemon, prepare_session_socket, serve_open_session,
     serve_session_daemon, start_session_daemon, stop_session_daemon,
@@ -84,6 +84,12 @@ async fn async_main(cli: Cli) -> ExitCode {
     // no KWin 6.6 or portal feature.
     if matches!(cli.command, Command::AbortWatch) {
         return abort_watch::run().await;
+    }
+
+    // Static list: no KWin, D-Bus, portal or session daemon.
+    if matches!(cli.command, Command::AxFeatures) {
+        println!("{}", cu_atspi::features_json());
+        return ExitCode::SUCCESS;
     }
 
     // No tracing for the AT-SPI commands, whatever RUST_LOG says: the
@@ -350,44 +356,22 @@ async fn run(cli: Cli) -> Result<()> {
         Command::AxRestore { holder_pid } => {
             print_json(&cu_atspi::restore(holder_pid).await?)?;
         }
-        Command::AxFind {
-            window,
-            role,
-            title_contains,
-            all,
-            include_hidden,
-            max_nodes,
-            max_depth,
-        } => {
-            let opts = ax::FindOptions {
-                role,
-                title_contains,
-                all,
-                include_hidden,
-                max_nodes,
-                max_depth,
-            };
-            print_json(&ax::find(&kwin(), &window, opts).await?)?;
+        Command::AxFind { window, ax } => {
+            print_json(&ax::find(&kwin(), &window, &ax).await?)?;
         }
-        Command::AxAction {
-            scope,
-            element_ref,
-            action,
-        } => {
-            // set-text reads its text from stdin only (never argv, never logged).
-            let action = match action {
-                AxActionKind::Click => cu_atspi::Action::Click,
-                AxActionKind::Focus => cu_atspi::Action::Focus,
-                AxActionKind::SetText => match ax::read_stdin_text()? {
-                    Ok(text) => cu_atspi::Action::SetText(text),
-                    Err(ax::StdinNotUtf8) => {
-                        eprintln!("Error: the text on stdin is not valid UTF-8");
-                        std::process::exit(2);
-                    }
-                },
+        Command::AxAction { ax } => {
+            // set-text / set-value read their input from stdin only (never argv, never logged).
+            // This bridge runs on KDE Wayland sessions: the target is never an X11 session.
+            let request = match ax.request(false, std::io::stdin().lock()) {
+                Ok(request) => request,
+                Err(error) => {
+                    eprintln!("Error: {error}");
+                    std::process::exit(if error.is_usage() { 2 } else { 1 });
+                }
             };
-            print_json(&cu_atspi::action(&element_ref, &action, &scope).await?)?;
+            print_json(&cu_atspi::act(&request).await?)?;
         }
+        Command::AxFeatures => unreachable!("ax-features is dispatched in main"),
         Command::TeachOverlayPreview {
             payload,
             display,
