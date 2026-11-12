@@ -23,13 +23,35 @@ const BADGE_FADE_DURATION_SECONDS: f32 = 0.8;
 
 const GLOW_BANDS: [(f32, f32); 3] = [(0.16, 0.22), (0.09, 0.15), (0.03, 0.07)];
 
+/// Set to `0` for `session-start` (the daemon it spawns inherits it) to leave
+/// the iced session glow out: the caller draws its own indicator through the
+/// `overlay` subcommand instead. `set-overlay-display` stays a successful
+/// no-op then. Any other value, or unset: the glow runs as always.
+pub const SESSION_OVERLAY_ENV: &str = "KWIN_PORTAL_BRIDGE_SESSION_OVERLAY";
+
+/// Whether the daemon draws the iced session glow, from the value of
+/// [`SESSION_OVERLAY_ENV`]. Only an exact `0` turns it off.
+pub fn session_overlay_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("0"))
+}
+
 pub struct SessionOverlayProcess {
-    child: Child,
+    /// `None` when the glow is opted out ([`SESSION_OVERLAY_ENV`]).
+    child: Option<Child>,
     output: Option<String>,
 }
 
 impl SessionOverlayProcess {
+    /// Spawn the glow, or a disabled handle when [`SESSION_OVERLAY_ENV`] is
+    /// `0`: it starts nothing, and `set_output` / `shutdown` are no-ops.
     pub fn spawn(output: Option<&str>) -> Result<Self> {
+        if !session_overlay_enabled(std::env::var_os(SESSION_OVERLAY_ENV).as_deref()) {
+            eprintln!("[kwin-portal-bridge] session glow off ({SESSION_OVERLAY_ENV}=0)");
+            return Ok(Self {
+                child: None,
+                output: output.map(ToOwned::to_owned),
+            });
+        }
         let current_exe =
             std::env::current_exe().context("failed to resolve current executable")?;
         let mut command = Command::new(current_exe);
@@ -58,23 +80,31 @@ impl SessionOverlayProcess {
             .context("failed to spawn session activity overlay")?;
 
         Ok(Self {
-            child,
+            child: Some(child),
             output: output.map(ToOwned::to_owned),
         })
     }
 
     pub fn shutdown(&mut self) {
-        if matches!(self.child.try_wait(), Ok(Some(_))) {
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        if matches!(child.try_wait(), Ok(Some(_))) {
             return;
         }
 
-        self.child.kill().ok();
-        self.child.wait().ok();
+        child.kill().ok();
+        child.wait().ok();
     }
 
     pub fn set_output(&mut self, output: Option<&str>) -> Result<()> {
         let next_output = output.map(ToOwned::to_owned);
         if self.output == next_output {
+            return Ok(());
+        }
+        if self.child.is_none() {
+            // Opted out: nothing to move, the same empty answer as always.
+            self.output = next_output;
             return Ok(());
         }
 
@@ -300,5 +330,41 @@ fn app_style(_: &EdgeGlow, theme: &Theme) -> iced::theme::Style {
     iced::theme::Style {
         background_color: Color::TRANSPARENT,
         text_color: theme.palette().text,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn only_an_exact_zero_opts_out_of_the_session_glow() {
+        assert!(!session_overlay_enabled(Some(OsStr::new("0"))));
+        for on in [
+            None,
+            Some(""),
+            Some("1"),
+            Some("00"),
+            Some(" 0"),
+            Some("0 "),
+            Some("false"),
+            Some("off"),
+        ] {
+            assert!(session_overlay_enabled(on.map(OsStr::new)), "{on:?}");
+        }
+    }
+
+    #[test]
+    fn an_opted_out_handle_moves_and_shuts_down_as_a_no_op() {
+        let mut overlay = SessionOverlayProcess {
+            child: None,
+            output: None,
+        };
+        overlay.set_output(Some("DP-1")).unwrap();
+        assert_eq!(overlay.output.as_deref(), Some("DP-1"));
+        overlay.set_output(None).unwrap();
+        assert!(overlay.output.is_none() && overlay.child.is_none());
+        overlay.shutdown();
     }
 }
